@@ -72,6 +72,11 @@ public class UserImpl implements User, InternalUserAttachableListenerManager {
         } else {
             avatarHash = null;
         }
+        if (data.hasNonNull("global_name")) {
+            member = member.setNickname(data.get("global_name").asText());
+        } else {
+            member = member.setNickname(null);
+        }
         if (data.has("public_flags")) {
             int flags = data.get("public_flags").asInt();
             for (UserFlag flag : UserFlag.values()) {
@@ -117,7 +122,14 @@ public class UserImpl implements User, InternalUserAttachableListenerManager {
         }
 
         bot = data.hasNonNull("bot") && data.get("bot").asBoolean();
-        member = new MemberImpl(api, server, memberJson, this);
+
+        MemberImpl memberTemp = new MemberImpl(api, server, memberJson, this);
+        if (data.hasNonNull("global_name")) {
+            memberTemp = memberTemp.setNickname(data.get("global_name").asText());
+        } else {
+            memberTemp = memberTemp.setNickname(null);
+        }
+        member = memberTemp;
     }
 
     private UserImpl(DiscordApiImpl api, Long id, String name, String discriminator, String avatarHash, boolean bot,

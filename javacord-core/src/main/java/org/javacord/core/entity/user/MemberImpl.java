@@ -66,10 +66,10 @@ public final class MemberImpl implements Member {
             this.user = user;
         }
 
-        if (data.hasNonNull("nick")) {
-            nickname = data.get("nick").asText();
+        if (data.hasNonNull("user") && data.get("user").hasNonNull("global_name")) {
+            this.nickname = data.get("user").get("global_name").asText();
         } else {
-            nickname = null;
+            this.nickname = null;
         }
 
         roleIds = new ArrayList<>();
