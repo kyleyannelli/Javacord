@@ -514,8 +514,8 @@ public class DiscordWebSocketAdapter extends WebSocketAdapter {
                 })
                 .orElse("'unknown'");
 
-        boolean logReconnect = !closeCodeString.equals("COMMANDED_RECONNECT")
-            && !closeReason.equals("No more WebSocket frame from the server.");
+        boolean logReconnect = !closeCodeString.equals("COMMANDED_RECONNECT") &&
+            !closeReason.equals("No more WebSocket frame from the server.");
         if (logReconnect) {
             logger.info("Websocket closed with reason '{}' and code {} by {}!",
                     closeReason, closeCodeString, closedByServer ? "server" : "client");
