@@ -514,8 +514,11 @@ public class DiscordWebSocketAdapter extends WebSocketAdapter {
                 })
                 .orElse("'unknown'");
 
-        logger.info("Websocket closed with reason '{}' and code {} by {}!",
+        boolean logReconnect = !closeCodeString.equals("COMMANDED_RECONNECT") && !closeReason.equals("No more WebSocket frame from the server.");
+        if (logReconnect) {
+            logger.info("Websocket closed with reason '{}' and code {} by {}!",
                     closeReason, closeCodeString, closedByServer ? "server" : "client");
+        }
 
         LostConnectionEvent lostConnectionEvent = new LostConnectionEventImpl(api);
         api.getEventDispatcher().dispatchLostConnectionEvent(null, lostConnectionEvent);
@@ -541,7 +544,9 @@ public class DiscordWebSocketAdapter extends WebSocketAdapter {
             } finally {
                 reconnectingOrResumingLock.unlock();
             }
-            logger.info("Trying to reconnect/resume in {} seconds!", api.getReconnectDelay(reconnectAttempt.get()));
+            if (logReconnect) {
+                logger.info("Trying to reconnect/resume in {} seconds!", api.getReconnectDelay(reconnectAttempt.get()));
+            }
             // Reconnect after a (short?) delay depending on the amount of reconnect attempts
             api.getThreadPool().getScheduler()
                     .schedule(this::connect, api.getReconnectDelay(reconnectAttempt.get()), TimeUnit.SECONDS);
