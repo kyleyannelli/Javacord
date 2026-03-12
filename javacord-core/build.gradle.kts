@@ -36,6 +36,9 @@ dependencies {
     // voice encryption to support XChaCha20
     implementation("com.google.crypto.tink:tink:1.15.0")
 
+    // JNA for native libdave bindings (DAVE E2EE protocol)
+    implementation("net.java.dev.jna:jna:5.16.0")
+
     // logging
     implementation("org.apache.logging.log4j:log4j-api:2.17.2")
 

@@ -291,6 +291,10 @@ public class AudioConnectionImpl implements AudioConnection, InternalAudioConnec
      * Performs a full reconnect of the audio connection by sending a new voice state update.
      */
     public void reconnect() {
+        AudioWebSocketAdapter oldAdapter = websocketAdapter;
+        if (oldAdapter != null) {
+            oldAdapter.cleanupDaveResources();
+        }
         websocketAdapter = null;
         sessionId = null;
         token = null;

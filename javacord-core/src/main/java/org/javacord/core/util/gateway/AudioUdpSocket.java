@@ -3,11 +3,13 @@ package org.javacord.core.util.gateway;
 import org.apache.logging.log4j.Logger;
 import org.javacord.api.audio.AudioSource;
 import org.javacord.api.audio.AudioSourceBase;
+import org.javacord.api.audio.SilentAudioSource;
 import org.javacord.api.util.crypto.AudioEncryptor;
 import org.javacord.core.DiscordApiImpl;
 import org.javacord.core.audio.AudioConnectionImpl;
 import org.javacord.core.entity.server.ServerImpl;
 import org.javacord.core.event.audio.AudioSourceFinishedEventImpl;
+import org.javacord.core.util.dave.DaveFrameEncryptor;
 import org.javacord.core.util.logging.LoggerUtil;
 import java.io.IOException;
 import java.net.DatagramPacket;
@@ -15,6 +17,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
+import java.util.Optional;
 
 public class AudioUdpSocket {
 
@@ -33,10 +36,10 @@ public class AudioUdpSocket {
 
     private volatile boolean shouldSend = false;
 
-    /**
-     * The secret key used to encrypt audio packets.
-     */
     private byte[] secretKey;
+
+    private volatile DaveFrameEncryptor daveEncryptor;
+    private volatile int daveSsrc;
 
     /**
      * Gets incremented for every packet sent.
@@ -73,6 +76,21 @@ public class AudioUdpSocket {
      */
     public void setSecretKey(byte[] secretKey) {
         this.secretKey = secretKey;
+    }
+
+    /**
+     * Sets the DAVE frame encryptor for E2EE audio encryption.
+     *
+     * <p>When set, Opus frames are DAVE-encrypted before transport encryption.
+     * The encryptor is managed by the {@link org.javacord.core.util.dave.DaveSessionManager} and its key
+     * ratchet is updated on MLS epoch transitions.
+     *
+     * @param daveEncryptor The DAVE frame encryptor instance.
+     * @param ssrc          The SSRC assigned to this audio stream.
+     */
+    public void setDaveEncryptor(DaveFrameEncryptor daveEncryptor, int ssrc) {
+        this.daveEncryptor = daveEncryptor;
+        this.daveSsrc = ssrc;
     }
 
     /**
@@ -156,15 +174,25 @@ public class AudioUdpSocket {
                             connection.setSpeaking(true);
                         }
 
+                        byte[] frameForPacket = frame != null
+                                ? frame : SilentAudioSource.SILENCE_FRAME;
+                        DaveFrameEncryptor currentDaveEncryptor = daveEncryptor;
+                        if (currentDaveEncryptor != null) {
+                            Optional<byte[]> daveEncrypted =
+                                    currentDaveEncryptor.encrypt(daveSsrc, frameForPacket);
+                            if (daveEncrypted.isPresent()) {
+                                frameForPacket = daveEncrypted.get();
+                            }
+                        }
+
                         packet = new AudioPacket(
-                                frame,
+                                frameForPacket,
                                 sequence,
                                 ((int) sequence * 960),
                                 ssrc,
                                 this.audioEncryptor
                         );
 
-                        // We can stop sending frames of silence after 5 frames
                         if (frame == null) {
                             framesOfSilenceToPlay--;
                             if (framesOfSilenceToPlay == 0) {

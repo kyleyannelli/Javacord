@@ -15,6 +15,8 @@ import org.javacord.api.util.crypto.AudioEncryptor;
 import org.javacord.core.DiscordApiImpl;
 import org.javacord.core.audio.AudioConnectionImpl;
 import org.javacord.core.util.crypto.AudioEncryptionMode;
+import org.javacord.core.util.dave.DaveSessionManager;
+import org.javacord.core.util.dave.LibDaveLoader;
 import org.javacord.core.util.logging.LoggerUtil;
 import org.javacord.core.util.logging.WebSocketLogger;
 
@@ -22,9 +24,11 @@ import javax.net.ssl.SSLContext;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,24 +36,23 @@ import java.util.zip.DataFormatException;
 
 public class AudioWebSocketAdapter extends WebSocketAdapter {
 
-    /**
-     * The logger of this class.
-     */
     private static final Logger logger = LoggerUtil.getLogger(AudioWebSocketAdapter.class);
 
-    /**
-     * The audio connection for this websocket.
-     */
+    private static final Set<Integer> DAVE_BINARY_OPCODES = Set.of(
+            VoiceGatewayOpcode.DAVE_MLS_EXTERNAL_SENDER.getCode(),
+            VoiceGatewayOpcode.DAVE_MLS_PROPOSALS.getCode(),
+            VoiceGatewayOpcode.DAVE_MLS_COMMIT_TRANSITION.getCode(),
+            VoiceGatewayOpcode.DAVE_MLS_WELCOME.getCode()
+    );
+
     private final AudioConnectionImpl connection;
-
     private final DiscordApiImpl api;
-
     private final AtomicReference<WebSocket> websocket = new AtomicReference<>();
-
     private final Heart heart;
 
     private AudioUdpSocket socket;
     private int ssrc;
+    private DaveSessionManager daveManager;
 
     /**
      * A boolean to indicate if the websocket should try to reconnect.
@@ -156,12 +159,65 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
                 data = packet.get("d");
                 byte[] secretKey = api.getObjectMapper().convertValue(data.get("secret_key"), byte[].class);
                 socket.setSecretKey(secretKey);
-                socket.startSending();
-                // We established a connection with the udp socket. Now we are ready to send audio! :-)
-                connection.getReadyFuture().complete(connection);
+
+                int daveProtocolVersion = data.has("dave_protocol_version")
+                        ? data.get("dave_protocol_version").asInt(0) : 0;
+
+                if (daveProtocolVersion > 0 && LibDaveLoader.isAvailable()) {
+                    initializeDaveSession(daveProtocolVersion);
+                    socket.setDaveEncryptor(daveManager.getEncryptor(), ssrc);
+                    socket.startSending();
+                    logger.info("DAVE protocol version {} active for {}", daveProtocolVersion, connection);
+                } else {
+                    socket.startSending();
+                    connection.getReadyFuture().complete(connection);
+                    if (daveProtocolVersion > 0) {
+                        logger.warn("Voice gateway requested DAVE protocol version {} but libdave is not available. "
+                                + "Voice may not work correctly for {}", daveProtocolVersion, connection);
+                    }
+                }
+                break;
+            case CLIENT_CONNECT:
+                data = packet.get("d");
+                if (daveManager != null && data.has("user_id")) {
+                    daveManager.addRecognizedUser(data.get("user_id").asText());
+                    logger.debug("Client connected: {} for {}", data.get("user_id").asText(), connection);
+                }
+                break;
+            case CLIENT_DISCONNECT:
+                data = packet.get("d");
+                if (daveManager != null && data.has("user_id")) {
+                    daveManager.removeRecognizedUser(data.get("user_id").asText());
+                    logger.debug("Client disconnected: {} for {}", data.get("user_id").asText(), connection);
+                }
+                break;
+            case DAVE_PREPARE_TRANSITION:
+                data = packet.get("d");
+                if (daveManager != null) {
+                    int transProtocolVersion = data.get("protocol_version").asInt(0);
+                    int transId = data.get("transition_id").asInt(0);
+                    daveManager.handlePrepareTransition(transProtocolVersion, transId);
+                }
+                break;
+            case DAVE_EXECUTE_TRANSITION:
+                data = packet.get("d");
+                if (daveManager != null) {
+                    int executeTransId = data.get("transition_id").asInt(0);
+                    daveManager.handleExecuteTransition(executeTransId);
+                    if (!connection.getReadyFuture().isDone()) {
+                        connection.getReadyFuture().complete(connection);
+                    }
+                }
+                break;
+            case DAVE_PREPARE_EPOCH:
+                data = packet.get("d");
+                if (daveManager != null) {
+                    long epoch = data.get("epoch").asLong(0);
+                    int epochProtocolVersion = data.get("protocol_version").asInt(0);
+                    daveManager.handlePrepareEpoch(epoch, epochProtocolVersion);
+                }
                 break;
             case HEARTBEAT_ACK:
-                // Handled in the heart
                 break;
             case RESUMED:
                 resuming = false;
@@ -175,6 +231,11 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
 
     @Override
     public void onBinaryMessage(WebSocket websocket, byte[] binary) throws Exception {
+        if (binary.length >= 3 && DAVE_BINARY_OPCODES.contains(binary[2] & 0xFF)) {
+            handleDaveBinaryMessage(binary);
+            return;
+        }
+
         String message;
         try {
             message = BinaryMessageDecompressor.decompress(binary);
@@ -216,10 +277,10 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
         logger.info("Websocket closed with reason '{}' and code {} by {} for {}!",
                 closeReason, closeCodeString, closedByServer ? "server" : "client", connection);
 
-        // Squash heart, until it stops beating
         heart.squash();
-        //Pause UDP sending
-        socket.stopSending();
+        if (socket != null) {
+            socket.stopSending();
+        }
 
         if (resuming) {
             logger.info("Could not resume, reconnecting in {} seconds", api.getReconnectDelay(reconnectAttempt.get()));
@@ -282,6 +343,84 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
     }
 
     /**
+     * Routes a DAVE binary frame to the appropriate session manager handler.
+     *
+     * <p>Server-to-client binary frames have the format:
+     * {@code [uint16 sequence][uint8 opcode][payload...]}.
+     * The 3-byte header is stripped before passing the payload to handlers.
+     *
+     * @param frame The complete binary frame including the 3-byte header.
+     */
+    private void handleDaveBinaryMessage(byte[] frame) {
+        if (daveManager == null) {
+            logger.debug("Received DAVE binary opcode {} but no session manager is active", frame[2] & 0xFF);
+            return;
+        }
+
+        int opcode = frame[2] & 0xFF;
+        byte[] payload = Arrays.copyOfRange(frame, 3, frame.length);
+
+        Optional<VoiceGatewayOpcode> gatewayOpcode = VoiceGatewayOpcode.fromCode(opcode);
+        if (!gatewayOpcode.isPresent()) {
+            logger.debug("Received unknown DAVE binary opcode {}", opcode);
+            return;
+        }
+
+        switch (gatewayOpcode.get()) {
+            case DAVE_MLS_EXTERNAL_SENDER:
+                daveManager.handleExternalSender(payload);
+                break;
+            case DAVE_MLS_PROPOSALS:
+                daveManager.handleProposals(payload);
+                break;
+            case DAVE_MLS_COMMIT_TRANSITION:
+                daveManager.handleCommitTransition(payload);
+                break;
+            case DAVE_MLS_WELCOME:
+                daveManager.handleWelcome(payload);
+                break;
+            default:
+                logger.debug("Unhandled DAVE binary opcode {} for {}", opcode, connection);
+                break;
+        }
+    }
+
+    /**
+     * Initializes the DAVE session manager for E2EE audio.
+     *
+     * @param protocolVersion The DAVE protocol version from the session description.
+     */
+    private void initializeDaveSession(int protocolVersion) {
+        WebSocket ws = websocket.get();
+        DaveSessionManager.VoiceGatewaySender sender = new DaveSessionManager.VoiceGatewaySender() {
+            @Override
+            public void sendBinaryFrame(byte[] frame) {
+                ws.sendBinary(frame);
+            }
+
+            @Override
+            public void sendTextFrame(String text) {
+                ws.sendFrame(WebSocketFrame.createTextFrame(text));
+            }
+        };
+
+        daveManager = new DaveSessionManager(
+                connection.getServer().getId(),
+                connection.getServer().getApi().getYourself().getIdAsString(),
+                sender);
+        daveManager.initialize(protocolVersion, ssrc);
+    }
+
+    /**
+     * Gets the DAVE session manager, if active.
+     *
+     * @return The DAVE session manager, or {@code null} if DAVE is not active.
+     */
+    public DaveSessionManager getDaveManager() {
+        return daveManager;
+    }
+
+    /**
      * Connects the websocket.
      */
     private void connect() {
@@ -330,13 +469,31 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
     }
 
     /**
-     * Disconnects from the websocket.
+     * Releases DAVE native resources without disconnecting the websocket.
+     *
+     * <p>Called during reconnect to ensure native handles are freed when
+     * the adapter is being replaced.
+     */
+    public void cleanupDaveResources() {
+        if (daveManager != null) {
+            daveManager.close();
+            daveManager = null;
+        }
+    }
+
+    /**
+     * Disconnects from the websocket and releases DAVE resources.
      */
     public void disconnect() {
         reconnect = false;
-        socket.stopSending();
+        if (socket != null) {
+            socket.stopSending();
+        }
+        if (daveManager != null) {
+            daveManager.close();
+            daveManager = null;
+        }
         websocket.get().sendClose(WebSocketCloseReason.DISCONNECT.getNumericCloseCode());
-        // cancel heartbeat timer if within one minute no disconnect event was dispatched
         api.getThreadPool().getDaemonScheduler().schedule(heart::squash, 1, TimeUnit.MINUTES);
     }
 
@@ -360,6 +517,9 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
     /**
      * Sends the identify packet.
      *
+     * <p>When libdave is available, includes {@code max_dave_protocol_version}
+     * to signal DAVE E2EE support to the voice gateway.
+     *
      * @param websocket The websocket the identify packet should be sent to.
      */
     private void sendIdentify(WebSocket websocket) {
@@ -370,7 +530,16 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
                 .put("user_id", connection.getServer().getApi().getYourself().getIdAsString())
                 .put("session_id", connection.getSessionId())
                 .put("token", connection.getToken());
-        logger.debug("Sending voice identify packet for {}", connection);
+
+        if (LibDaveLoader.isAvailable()) {
+            int maxDaveVersion = LibDaveLoader.getInstance().daveMaxSupportedProtocolVersion();
+            data.put("max_dave_protocol_version", maxDaveVersion);
+            logger.debug("Sending voice identify packet with max_dave_protocol_version={} for {}",
+                    maxDaveVersion, connection);
+        } else {
+            logger.debug("Sending voice identify packet (DAVE unavailable) for {}", connection);
+        }
+
         WebSocketFrame identifyFrame = WebSocketFrame.createTextFrame(identifyPacket.toString());
         websocket.sendFrame(identifyFrame);
     }

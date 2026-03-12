@@ -4,9 +4,9 @@
 */build/
 
 # Eclipse project files
-/.classpath
-/.project
-/.settings/
+.classpath
+.project
+.settings/
 
 # IntelliJ IDEA project files
 /.idea/

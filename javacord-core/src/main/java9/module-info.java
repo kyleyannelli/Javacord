@@ -2,6 +2,7 @@
 module org.javacord.core {
     requires okhttp3.logging;
     requires com.google.crypto.tink;
+    requires com.sun.jna;
 
     requires java.logging;
 
