@@ -440,4 +440,222 @@ class DaveSessionManagerTest extends Specification {
         then:
             manager.decryptor != null
     }
+
+    // --- Group A: Recognized users forwarded to native calls ---
+
+    def 'handleWelcome passes recognized users to native session'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.addRecognizedUser('111')
+            manager.addRecognizedUser('222')
+            manager.addRecognizedUser('333')
+            byte[] payload = [0x00, 0x01, 0x01] as byte[]
+
+        when:
+            manager.handleWelcome(payload)
+
+        then:
+            1 * lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _,
+                    { String[] ids -> ids.toList().toSet() == ['111', '222', '333'].toSet() },
+                    3) >> null
+    }
+
+    def 'handleProposals passes recognized users to native session'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.addRecognizedUser('AAA')
+            manager.addRecognizedUser('BBB')
+            byte[] proposalsData = [0x01, 0x02] as byte[]
+
+        when:
+            manager.handleProposals(proposalsData)
+
+        then:
+            1 * lib.daveSessionProcessProposals(FAKE_SESSION_HANDLE, proposalsData, 2,
+                    { String[] ids -> ids.toList().toSet() == ['AAA', 'BBB'].toSet() }, 2,
+                    _ as PointerByReference, _ as IntByReference)
+    }
+
+    // --- Group B: Passthrough mode during recovery ---
+
+    def 'failed commit recovery puts encryptor in passthrough mode'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x07, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> true
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            1 * lib.daveEncryptorSetPassthroughMode(FAKE_ENCRYPTOR_HANDLE, true)
+    }
+
+    def 'failed welcome recovery puts encryptor in passthrough mode'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x04, 0x01] as byte[]
+            lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _, _ as String[], _) >> null
+
+        when:
+            manager.handleWelcome(payload)
+
+        then:
+            1 * lib.daveEncryptorSetPassthroughMode(FAKE_ENCRYPTOR_HANDLE, true)
+    }
+
+    // --- Group C: Recovery preserves state ---
+
+    def 'recovery after failed commit preserves recognized users'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.addRecognizedUser('111')
+            manager.addRecognizedUser('222')
+            byte[] payload = [0x00, 0x07, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> true
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            manager.@recognizedUserIds.containsAll(['111', '222'])
+            manager.@recognizedUserIds.size() == 2
+    }
+
+    def 'recovery after failed welcome preserves recognized users'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.addRecognizedUser('111')
+            manager.addRecognizedUser('222')
+            byte[] payload = [0x00, 0x04, 0x01] as byte[]
+            lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _, _ as String[], _) >> null
+
+        when:
+            manager.handleWelcome(payload)
+
+        then:
+            manager.@recognizedUserIds.containsAll(['111', '222'])
+            manager.@recognizedUserIds.size() == 2
+    }
+
+    // --- Group D: Key ratchet management ---
+
+    def 'successful commit sets key ratchet on encryptor'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x05, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> false
+            lib.daveCommitResultIsIgnored(commitResultHandle) >> false
+            lib.daveSessionGetKeyRatchet(FAKE_SESSION_HANDLE, SELF_USER_ID) >> FAKE_KEY_RATCHET
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            1 * lib.daveEncryptorSetKeyRatchet(FAKE_ENCRYPTOR_HANDLE, FAKE_KEY_RATCHET)
+    }
+
+    def 'successful welcome sets key ratchet on encryptor'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x01, 0x01] as byte[]
+            Pointer welcomeResultHandle = new Pointer(11L)
+            lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _, _ as String[], _) >> welcomeResultHandle
+            lib.daveSessionGetKeyRatchet(FAKE_SESSION_HANDLE, SELF_USER_ID) >> FAKE_KEY_RATCHET
+
+        when:
+            manager.handleWelcome(payload)
+
+        then:
+            1 * lib.daveEncryptorSetKeyRatchet(FAKE_ENCRYPTOR_HANDLE, FAKE_KEY_RATCHET)
+    }
+
+    // --- Group E: Native resource cleanup ---
+
+    def 'commit result handle is destroyed after successful processing'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x05, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> false
+            lib.daveCommitResultIsIgnored(commitResultHandle) >> false
+            lib.daveSessionGetKeyRatchet(FAKE_SESSION_HANDLE, SELF_USER_ID) >> FAKE_KEY_RATCHET
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            1 * lib.daveCommitResultDestroy(commitResultHandle)
+    }
+
+    def 'commit result handle is destroyed after failed processing'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x07, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> true
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            1 * lib.daveCommitResultDestroy(commitResultHandle)
+    }
+
+    def 'welcome result handle is destroyed after successful processing'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] payload = [0x00, 0x01, 0x01] as byte[]
+            Pointer welcomeResultHandle = new Pointer(11L)
+            lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _, _ as String[], _) >> welcomeResultHandle
+            lib.daveSessionGetKeyRatchet(FAKE_SESSION_HANDLE, SELF_USER_ID) >> FAKE_KEY_RATCHET
+
+        when:
+            manager.handleWelcome(payload)
+
+        then:
+            1 * lib.daveWelcomeResultDestroy(welcomeResultHandle)
+    }
+
+    // --- Group F: Full lifecycle ---
+
+    def 'full recovery: failed commit then new welcome re-establishes session'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.addRecognizedUser('111')
+            Pointer failedCommitResult = new Pointer(10L)
+            Pointer newWelcomeResult = new Pointer(12L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> failedCommitResult
+            lib.daveCommitResultIsFailed(failedCommitResult) >> true
+            lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _, _ as String[], _) >> newWelcomeResult
+            lib.daveSessionGetKeyRatchet(FAKE_SESSION_HANDLE, SELF_USER_ID) >> FAKE_KEY_RATCHET
+
+        when: 'commit fails'
+            manager.handleCommitTransition([0x00, 0x07, 0x01] as byte[])
+
+        then: 'encryptor goes to passthrough and state resets to AWAITING_GROUP'
+            1 * lib.daveEncryptorSetPassthroughMode(FAKE_ENCRYPTOR_HANDLE, true)
+            manager.state == DaveSessionManager.State.AWAITING_GROUP
+
+        when: 'new welcome arrives and succeeds'
+            manager.handleWelcome([0x00, 0x08, 0x01] as byte[])
+
+        then: 'state transitions to TRANSITIONING'
+            manager.state == DaveSessionManager.State.TRANSITIONING
+
+        when: 'execute transition'
+            manager.handleExecuteTransition(8)
+
+        then: 'session is fully re-established with encryption active'
+            manager.state == DaveSessionManager.State.ESTABLISHED
+            1 * lib.daveEncryptorSetPassthroughMode(FAKE_ENCRYPTOR_HANDLE, false)
+    }
 }

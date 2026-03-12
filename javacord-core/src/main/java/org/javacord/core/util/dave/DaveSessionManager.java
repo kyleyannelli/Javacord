@@ -411,6 +411,9 @@ public class DaveSessionManager implements AutoCloseable {
     }
 
     private void resetAndResendKeyPackage() {
+        if (encryptor != null) {
+            encryptor.setPassthroughMode(true);
+        }
         if (session != null) {
             session.reset();
             session.init(protocolVersion, guildId, selfUserId);

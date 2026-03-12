@@ -404,11 +404,18 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
             }
         };
 
+        long selfId = connection.getServer().getApi().getYourself().getId();
         daveManager = new DaveSessionManager(
                 connection.getServer().getId(),
-                connection.getServer().getApi().getYourself().getIdAsString(),
+                String.valueOf(selfId),
                 sender);
         daveManager.initialize(protocolVersion, ssrc);
+
+        for (long userId : connection.getChannel().getConnectedUserIds()) {
+            if (userId != selfId) {
+                daveManager.addRecognizedUser(String.valueOf(userId));
+            }
+        }
     }
 
     /**
