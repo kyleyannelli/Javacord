@@ -1,5 +1,6 @@
 package org.javacord.core.util.dave;
 
+import com.sun.jna.Callback;
 import com.sun.jna.Library;
 import com.sun.jna.Pointer;
 import com.sun.jna.ptr.IntByReference;
@@ -378,4 +379,35 @@ public interface LibDave extends Library {
      * @return Maximum possible plaintext size in bytes.
      */
     int daveDecryptorGetMaxPlaintextByteSize(Pointer decryptor, int mediaType, int encryptedFrameSize);
+
+    // ---- Logging ----
+
+    int DAVE_LOGGING_SEVERITY_VERBOSE = 0;
+    int DAVE_LOGGING_SEVERITY_INFO = 1;
+    int DAVE_LOGGING_SEVERITY_WARNING = 2;
+    int DAVE_LOGGING_SEVERITY_ERROR = 3;
+    int DAVE_LOGGING_SEVERITY_NONE = 4;
+
+    /**
+     * Callback interface for receiving log messages from the native library.
+     */
+    interface LogSinkCallback extends Callback {
+
+        /**
+         * Called by the native library with log messages.
+         *
+         * @param severity Log severity level.
+         * @param file     Source file name where the log originated.
+         * @param line     Line number in the source file.
+         * @param message  Log message text.
+         */
+        void invoke(int severity, String file, int line, String message);
+    }
+
+    /**
+     * Sets a global callback for receiving log messages from the library.
+     *
+     * @param callback Log sink callback, or {@code null} to restore default logging.
+     */
+    void daveSetLogSinkCallback(LogSinkCallback callback);
 }

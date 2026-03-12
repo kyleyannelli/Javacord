@@ -20,6 +20,8 @@ public final class LibDaveLoader {
     private static volatile LibDave instance;
     private static volatile boolean loadAttempted;
     private static volatile String loadError;
+    @SuppressWarnings("unused")
+    private static volatile LibDave.LogSinkCallback logSinkRef;
 
     private LibDaveLoader() {
     }
@@ -35,6 +37,7 @@ public final class LibDaveLoader {
                 if (!loadAttempted) {
                     try {
                         instance = Native.load("dave", LibDave.class);
+                        installLogSink(instance);
                         logger.info("Successfully loaded libdave (max protocol version: {})",
                                 instance.daveMaxSupportedProtocolVersion());
                     } catch (UnsatisfiedLinkError e) {
@@ -70,5 +73,29 @@ public final class LibDaveLoader {
     public static String getLoadError() {
         getInstance();
         return loadError;
+    }
+
+    private static void installLogSink(LibDave lib) {
+        Logger nativeLogger = LoggerUtil.getLogger("org.javacord.core.util.dave.native");
+        LibDave.LogSinkCallback sink = (severity, file, line, message) -> {
+            switch (severity) {
+                case LibDave.DAVE_LOGGING_SEVERITY_ERROR:
+                    nativeLogger.error("({}) {}", file, message);
+                    break;
+                case LibDave.DAVE_LOGGING_SEVERITY_WARNING:
+                    nativeLogger.warn("({}) {}", file, message);
+                    break;
+                case LibDave.DAVE_LOGGING_SEVERITY_INFO:
+                    nativeLogger.debug("({}) {}", file, message);
+                    break;
+                case LibDave.DAVE_LOGGING_SEVERITY_VERBOSE:
+                    nativeLogger.trace("({}) {}", file, message);
+                    break;
+                default:
+                    break;
+            }
+        };
+        logSinkRef = sink;
+        lib.daveSetLogSinkCallback(sink);
     }
 }
