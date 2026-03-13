@@ -157,7 +157,7 @@ public class DaveSessionManager implements AutoCloseable {
      * @param proposalsData The raw binary proposals payload.
      */
     public void handleProposals(byte[] proposalsData) {
-        if (session == null) {
+        if (session == null || state != State.ESTABLISHED) {
             return;
         }
 
@@ -179,6 +179,9 @@ public class DaveSessionManager implements AutoCloseable {
      */
     public void handleCommitTransition(byte[] payload) {
         if (session == null || payload.length < 2) {
+            return;
+        }
+        if (state != State.ESTABLISHED && state != State.TRANSITIONING) {
             return;
         }
 

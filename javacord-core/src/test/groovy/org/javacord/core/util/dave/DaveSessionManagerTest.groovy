@@ -122,6 +122,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleProposals invokes processProposals on native session'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] proposalsData = [0x01, 0x02] as byte[]
 
         when:
@@ -135,6 +136,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleCommitTransition parses transition ID from first two payload bytes'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x05, 0x01, 0x02, 0x03] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], 3) >> commitResultHandle
@@ -154,6 +156,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleCommitTransition with big-endian transition ID 0x0100 parses as 256'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x01, 0x00, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], 1) >> commitResultHandle
@@ -173,6 +176,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleCommitTransition on success transitions to TRANSITIONING and sends transition ready'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x0A, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -193,6 +197,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleCommitTransition on failed commit sends invalid commit and resets'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x07, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -211,6 +216,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleCommitTransition on ignored commit does not transition or send messages'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x01, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -228,6 +234,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleCommitTransition with too-short payload is a no-op'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
 
         when:
             manager.handleCommitTransition([0x01] as byte[])
@@ -441,6 +448,56 @@ class DaveSessionManagerTest extends Specification {
             manager.decryptor != null
     }
 
+    // --- State guards: proposals and commits rejected before group membership ---
+
+    def 'handleProposals in PENDING state is a no-op'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] proposalsData = [0x01, 0x02] as byte[]
+
+        when:
+            manager.handleProposals(proposalsData)
+
+        then:
+            0 * lib.daveSessionProcessProposals(_, _, _, _, _, _, _)
+    }
+
+    def 'handleProposals in AWAITING_GROUP state is a no-op'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExternalSender([0x01] as byte[])
+            byte[] proposalsData = [0x01, 0x02] as byte[]
+
+        when:
+            manager.handleProposals(proposalsData)
+
+        then:
+            0 * lib.daveSessionProcessProposals(_, _, _, _, _, _, _)
+    }
+
+    def 'handleCommitTransition in PENDING state is a no-op'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+
+        when:
+            manager.handleCommitTransition([0x00, 0x05, 0x01] as byte[])
+
+        then:
+            0 * lib.daveSessionProcessCommit(_, _, _)
+    }
+
+    def 'handleCommitTransition in AWAITING_GROUP state is a no-op'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExternalSender([0x01] as byte[])
+
+        when:
+            manager.handleCommitTransition([0x00, 0x05, 0x01] as byte[])
+
+        then:
+            0 * lib.daveSessionProcessCommit(_, _, _)
+    }
+
     // --- Group A: Recognized users forwarded to native calls ---
 
     def 'handleWelcome passes recognized users to native session'() {
@@ -463,6 +520,7 @@ class DaveSessionManagerTest extends Specification {
     def 'handleProposals passes recognized users to native session'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             manager.addRecognizedUser('AAA')
             manager.addRecognizedUser('BBB')
             byte[] proposalsData = [0x01, 0x02] as byte[]
@@ -481,6 +539,7 @@ class DaveSessionManagerTest extends Specification {
     def 'failed commit recovery puts encryptor in passthrough mode'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x07, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -511,6 +570,7 @@ class DaveSessionManagerTest extends Specification {
     def 'recovery after failed commit preserves recognized users'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             manager.addRecognizedUser('111')
             manager.addRecognizedUser('222')
             byte[] payload = [0x00, 0x07, 0x01] as byte[]
@@ -547,6 +607,7 @@ class DaveSessionManagerTest extends Specification {
     def 'successful commit sets key ratchet on encryptor'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x05, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -581,6 +642,7 @@ class DaveSessionManagerTest extends Specification {
     def 'commit result handle is destroyed after successful processing'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x05, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -598,6 +660,7 @@ class DaveSessionManagerTest extends Specification {
     def 'commit result handle is destroyed after failed processing'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             byte[] payload = [0x00, 0x07, 0x01] as byte[]
             Pointer commitResultHandle = new Pointer(10L)
             lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
@@ -630,6 +693,7 @@ class DaveSessionManagerTest extends Specification {
     def 'full recovery: failed commit then new welcome re-establishes session'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
             manager.addRecognizedUser('111')
             Pointer failedCommitResult = new Pointer(10L)
             Pointer newWelcomeResult = new Pointer(12L)
