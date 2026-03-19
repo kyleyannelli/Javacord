@@ -688,7 +688,94 @@ class DaveSessionManagerTest extends Specification {
             1 * lib.daveWelcomeResultDestroy(welcomeResultHandle)
     }
 
-    // --- Group F: Full lifecycle ---
+    // --- Group F: External sender caching ---
+
+    def 'handleExternalSender caches data for recovery'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] externalSenderData = [0x01, 0x02, 0x03] as byte[]
+
+        when:
+            manager.handleExternalSender(externalSenderData)
+
+        then:
+            manager.@lastExternalSender == externalSenderData
+    }
+
+    def 'recovery after failed commit restores cached external sender on session'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] externalSenderData = [0x0A, 0x0B, 0x0C] as byte[]
+            manager.handleExternalSender(externalSenderData)
+            manager.handleExecuteTransition(0)
+
+            byte[] payload = [0x00, 0x07, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> true
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            manager.state == DaveSessionManager.State.AWAITING_GROUP
+            manager.@lastExternalSender == externalSenderData
+            (1.._) * lib.daveSessionSetExternalSender(FAKE_SESSION_HANDLE, _ as byte[], 3)
+    }
+
+    def 'recovery after failed welcome restores cached external sender on session'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] externalSenderData = [0x0A, 0x0B] as byte[]
+            manager.handleExternalSender(externalSenderData)
+
+            byte[] payload = [0x00, 0x04, 0x01] as byte[]
+            lib.daveSessionProcessWelcome(FAKE_SESSION_HANDLE, _ as byte[], _, _ as String[], _) >> null
+
+        when:
+            manager.handleWelcome(payload)
+
+        then:
+            manager.state == DaveSessionManager.State.AWAITING_GROUP
+            manager.@lastExternalSender == externalSenderData
+            (1.._) * lib.daveSessionSetExternalSender(FAKE_SESSION_HANDLE, _ as byte[], 2)
+    }
+
+    def 'handlePrepareEpoch with epoch 1 restores cached external sender on session'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            byte[] externalSenderData = [0x05, 0x06] as byte[]
+            manager.handleExternalSender(externalSenderData)
+
+        when:
+            manager.handlePrepareEpoch(1, PROTOCOL_VERSION)
+
+        then:
+            manager.state == DaveSessionManager.State.AWAITING_GROUP
+            manager.@lastExternalSender == externalSenderData
+            (1.._) * lib.daveSessionSetExternalSender(FAKE_SESSION_HANDLE, _ as byte[], 2)
+    }
+
+    def 'recovery without prior external sender skips setExternalSender'() {
+        given:
+            manager.initialize(PROTOCOL_VERSION, SSRC)
+            manager.handleExecuteTransition(0)
+
+            byte[] payload = [0x00, 0x07, 0x01] as byte[]
+            Pointer commitResultHandle = new Pointer(10L)
+            lib.daveSessionProcessCommit(FAKE_SESSION_HANDLE, _ as byte[], _) >> commitResultHandle
+            lib.daveCommitResultIsFailed(commitResultHandle) >> true
+
+        when:
+            manager.handleCommitTransition(payload)
+
+        then:
+            manager.state == DaveSessionManager.State.AWAITING_GROUP
+            manager.@lastExternalSender == null
+            0 * lib.daveSessionSetExternalSender(_, _, _)
+    }
+
+    // --- Group G: Full lifecycle ---
 
     def 'full recovery: failed commit then new welcome re-establishes session'() {
         given:

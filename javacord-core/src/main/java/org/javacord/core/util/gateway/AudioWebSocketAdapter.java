@@ -378,12 +378,14 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
                 daveManager.handleExternalSender(payload);
                 break;
             case DAVE_MLS_PROPOSALS:
+                syncRecognizedUsers();
                 daveManager.handleProposals(payload);
                 break;
             case DAVE_MLS_COMMIT_TRANSITION:
                 daveManager.handleCommitTransition(payload);
                 break;
             case DAVE_MLS_WELCOME:
+                syncRecognizedUsers();
                 daveManager.handleWelcome(payload);
                 break;
             default:
@@ -418,6 +420,8 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
                 sender);
         daveManager.initialize(protocolVersion, ssrc);
 
+        daveManager.addRecognizedUser(String.valueOf(selfId));
+
         Set<Long> connectedUserIds = connection.getChannel().getConnectedUserIds();
         logger.debug("Initializing DAVE session for {}: populating recognized users from "
                 + "channel connected users: {} (self: {})", connection, connectedUserIds, selfId);
@@ -425,6 +429,19 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
             if (userId != selfId) {
                 daveManager.addRecognizedUser(String.valueOf(userId));
             }
+        }
+    }
+
+    /**
+     * Ensures all currently connected channel members are registered as recognized
+     * users on the DAVE session manager before processing MLS operations.
+     */
+    private void syncRecognizedUsers() {
+        if (daveManager == null) {
+            return;
+        }
+        for (long userId : connection.getChannel().getConnectedUserIds()) {
+            daveManager.addRecognizedUser(String.valueOf(userId));
         }
     }
 

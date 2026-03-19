@@ -54,6 +54,7 @@ public class DaveSessionManager implements AutoCloseable {
     private volatile int protocolVersion;
     private volatile int pendingTransitionId = -1;
     private int ssrc;
+    private byte[] lastExternalSender;
 
     private final Set<String> recognizedUserIds = ConcurrentHashMap.newKeySet();
 
@@ -143,6 +144,7 @@ public class DaveSessionManager implements AutoCloseable {
         }
 
         State oldState = state;
+        lastExternalSender = externalSenderData.clone();
         session.setExternalSender(externalSenderData);
         sendKeyPackage();
         state = State.AWAITING_GROUP;
@@ -331,8 +333,11 @@ public class DaveSessionManager implements AutoCloseable {
             if (session != null) {
                 session.reset();
                 session.setProtocolVersion(protocolVersion);
-                logger.debug("Session reset for epoch 1 in guild {} "
-                        + "[NOTE: external sender NOT re-applied after reset]", guildId);
+                if (lastExternalSender != null) {
+                    session.setExternalSender(lastExternalSender);
+                }
+                logger.debug("Session reset for epoch 1 in guild {} [externalSender={}]",
+                        guildId, lastExternalSender != null ? "restored" : "none");
             }
             sendKeyPackage();
             state = State.AWAITING_GROUP;
@@ -477,8 +482,11 @@ public class DaveSessionManager implements AutoCloseable {
         if (session != null) {
             session.reset();
             session.init(protocolVersion, guildId, selfUserId);
-            logger.debug("Session reset and re-initialized for guild {} "
-                    + "[NOTE: external sender NOT re-applied after reset]", guildId);
+            if (lastExternalSender != null) {
+                session.setExternalSender(lastExternalSender);
+            }
+            logger.debug("Session reset and re-initialized for guild {} [externalSender={}]",
+                    guildId, lastExternalSender != null ? "restored" : "none");
         }
         sendKeyPackage();
         state = State.AWAITING_GROUP;
