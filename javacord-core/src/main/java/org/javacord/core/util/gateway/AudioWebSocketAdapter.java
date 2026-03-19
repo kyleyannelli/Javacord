@@ -180,15 +180,19 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
             case CLIENT_CONNECT:
                 data = packet.get("d");
                 if (daveManager != null && data.has("user_id")) {
-                    daveManager.addRecognizedUser(data.get("user_id").asText());
-                    logger.debug("Client connected: {} for {}", data.get("user_id").asText(), connection);
+                    String connectUserId = data.get("user_id").asText();
+                    logger.debug("Client connected: {} for {} [daveState={}]",
+                            connectUserId, connection, daveManager.getState());
+                    daveManager.addRecognizedUser(connectUserId);
                 }
                 break;
             case CLIENT_DISCONNECT:
                 data = packet.get("d");
                 if (daveManager != null && data.has("user_id")) {
-                    daveManager.removeRecognizedUser(data.get("user_id").asText());
-                    logger.debug("Client disconnected: {} for {}", data.get("user_id").asText(), connection);
+                    String disconnectUserId = data.get("user_id").asText();
+                    logger.debug("Client disconnected: {} for {} [daveState={}]",
+                            disconnectUserId, connection, daveManager.getState());
+                    daveManager.removeRecognizedUser(disconnectUserId);
                 }
                 break;
             case DAVE_PREPARE_TRANSITION:
@@ -366,6 +370,9 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
             return;
         }
 
+        logger.debug("Received DAVE binary opcode {} ({}) for {} [daveState={}]",
+                opcode, gatewayOpcode.get().name(), connection, daveManager.getState());
+
         switch (gatewayOpcode.get()) {
             case DAVE_MLS_EXTERNAL_SENDER:
                 daveManager.handleExternalSender(payload);
@@ -411,7 +418,10 @@ public class AudioWebSocketAdapter extends WebSocketAdapter {
                 sender);
         daveManager.initialize(protocolVersion, ssrc);
 
-        for (long userId : connection.getChannel().getConnectedUserIds()) {
+        Set<Long> connectedUserIds = connection.getChannel().getConnectedUserIds();
+        logger.debug("Initializing DAVE session for {}: populating recognized users from "
+                + "channel connected users: {} (self: {})", connection, connectedUserIds, selfId);
+        for (long userId : connectedUserIds) {
             if (userId != selfId) {
                 daveManager.addRecognizedUser(String.valueOf(userId));
             }

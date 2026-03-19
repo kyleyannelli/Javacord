@@ -142,10 +142,13 @@ public class DaveSessionManager implements AutoCloseable {
             return;
         }
 
+        State oldState = state;
         session.setExternalSender(externalSenderData);
         sendKeyPackage();
         state = State.AWAITING_GROUP;
-        logger.debug("Received external sender, sent key package for guild {}", guildId);
+        logger.debug("Received external sender ({} bytes), sent key package for guild {} "
+                + "[state: {} -> AWAITING_GROUP, recognizedUsers: {}]",
+                externalSenderData.length, guildId, oldState, recognizedUserIds.size());
     }
 
     /**
@@ -158,9 +161,13 @@ public class DaveSessionManager implements AutoCloseable {
      */
     public void handleProposals(byte[] proposalsData) {
         if (session == null || state != State.ESTABLISHED) {
+            logger.debug("Ignoring proposals for guild {} [session={}, state={}]",
+                    guildId, session != null ? "present" : "null", state);
             return;
         }
 
+        logger.debug("Processing proposals for guild {} [recognizedUsers({}): {}]",
+                guildId, recognizedUserIds.size(), recognizedUserIds);
         Optional<byte[]> commitWelcome = session.processProposals(proposalsData, recognizedUserIds);
         commitWelcome.ifPresent(bytes -> {
             sendBinaryMessage(28, bytes);
@@ -179,9 +186,13 @@ public class DaveSessionManager implements AutoCloseable {
      */
     public void handleCommitTransition(byte[] payload) {
         if (session == null || payload.length < 2) {
+            logger.debug("Ignoring commit transition for guild {} [session={}, payloadLen={}]",
+                    guildId, session != null ? "present" : "null", payload.length);
             return;
         }
         if (state != State.ESTABLISHED && state != State.TRANSITIONING) {
+            logger.debug("Ignoring commit transition for guild {} [state={}, expected ESTABLISHED or TRANSITIONING]",
+                    guildId, state);
             return;
         }
 
@@ -189,16 +200,22 @@ public class DaveSessionManager implements AutoCloseable {
         byte[] commitData = new byte[payload.length - 2];
         System.arraycopy(payload, 2, commitData, 0, commitData.length);
 
+        logger.debug("Processing commit transition {} for guild {} [state={}, commitDataLen={}]",
+                transitionId, guildId, state, commitData.length);
+
         try (DaveCommitResult result = session.processCommit(commitData)) {
             if (result.isFailed()) {
-                logger.warn("Failed to process MLS commit for guild {}, sending invalid commit", guildId);
+                logger.warn("Failed to process MLS commit for guild {}, sending invalid commit "
+                        + "[transitionId={}, state={}, recognizedUsers({}): {}]",
+                        guildId, transitionId, state, recognizedUserIds.size(), recognizedUserIds);
                 sendInvalidCommitWelcome(transitionId);
                 resetAndResendKeyPackage();
                 return;
             }
 
             if (result.isIgnored()) {
-                logger.debug("Ignoring MLS commit for guild {}", guildId);
+                logger.debug("Ignoring MLS commit for guild {} [transitionId={}, state={}]",
+                        guildId, transitionId, state);
                 return;
             }
 
@@ -222,6 +239,8 @@ public class DaveSessionManager implements AutoCloseable {
      */
     public void handleWelcome(byte[] payload) {
         if (session == null || payload.length < 2) {
+            logger.debug("Ignoring welcome for guild {} [session={}, payloadLen={}]",
+                    guildId, session != null ? "present" : "null", payload.length);
             return;
         }
 
@@ -229,9 +248,16 @@ public class DaveSessionManager implements AutoCloseable {
         byte[] welcome = new byte[payload.length - 2];
         System.arraycopy(payload, 2, welcome, 0, welcome.length);
 
+        logger.debug("Processing welcome {} for guild {} [state={}, welcomeDataLen={}, "
+                + "recognizedUsers({}): {}]",
+                transitionId, guildId, state, welcome.length,
+                recognizedUserIds.size(), recognizedUserIds);
+
         try (DaveWelcomeResult result = session.processWelcome(welcome, recognizedUserIds)) {
             if (result.isFailed()) {
-                logger.warn("Failed to process MLS welcome for guild {}, sending invalid commit", guildId);
+                logger.warn("Failed to process MLS welcome for guild {}, sending invalid commit "
+                        + "[transitionId={}, state={}, recognizedUsers({}): {}]",
+                        guildId, transitionId, state, recognizedUserIds.size(), recognizedUserIds);
                 sendInvalidCommitWelcome(transitionId);
                 resetAndResendKeyPackage();
                 return;
@@ -298,16 +324,23 @@ public class DaveSessionManager implements AutoCloseable {
      * @param protocolVersion The protocol version for the new epoch.
      */
     public void handlePrepareEpoch(long epoch, int protocolVersion) {
+        State oldState = state;
         this.protocolVersion = protocolVersion;
 
         if (epoch == 1) {
             if (session != null) {
                 session.reset();
                 session.setProtocolVersion(protocolVersion);
+                logger.debug("Session reset for epoch 1 in guild {} "
+                        + "[NOTE: external sender NOT re-applied after reset]", guildId);
             }
             sendKeyPackage();
             state = State.AWAITING_GROUP;
-            logger.debug("Reset MLS group for epoch 1 in guild {}", guildId);
+            logger.debug("Reset MLS group for epoch 1 in guild {} [state: {} -> AWAITING_GROUP]",
+                    guildId, oldState);
+        } else {
+            logger.debug("Prepare epoch {} for guild {} [state={}, protocolVersion={}]",
+                    epoch, guildId, state, protocolVersion);
         }
     }
 
@@ -317,7 +350,11 @@ public class DaveSessionManager implements AutoCloseable {
      * @param userId The user ID string.
      */
     public void addRecognizedUser(String userId) {
-        recognizedUserIds.add(userId);
+        boolean added = recognizedUserIds.add(userId);
+        if (added) {
+            logger.debug("Added recognized user {} for guild {} [total: {}]",
+                    userId, guildId, recognizedUserIds.size());
+        }
     }
 
     /**
@@ -326,7 +363,11 @@ public class DaveSessionManager implements AutoCloseable {
      * @param userId The user ID string.
      */
     public void removeRecognizedUser(String userId) {
-        recognizedUserIds.remove(userId);
+        boolean removed = recognizedUserIds.remove(userId);
+        if (removed) {
+            logger.debug("Removed recognized user {} for guild {} [total: {}]",
+                    userId, guildId, recognizedUserIds.size());
+        }
     }
 
     /**
@@ -379,10 +420,16 @@ public class DaveSessionManager implements AutoCloseable {
 
     private void sendKeyPackage() {
         if (session == null) {
+            logger.debug("Cannot send key package for guild {}: session is null", guildId);
             return;
         }
         Optional<byte[]> keyPackage = session.getMarshalledKeyPackage();
-        keyPackage.ifPresent(bytes -> sendBinaryMessage(26, bytes));
+        if (keyPackage.isPresent()) {
+            sendBinaryMessage(26, keyPackage.get());
+            logger.debug("Sent key package ({} bytes) for guild {}", keyPackage.get().length, guildId);
+        } else {
+            logger.warn("Failed to generate key package for guild {} [state={}]", guildId, state);
+        }
     }
 
     private void prepareSenderKeyRatchets() {
@@ -397,12 +444,16 @@ public class DaveSessionManager implements AutoCloseable {
     }
 
     private void executeTransitionImmediately(int transitionId) {
+        State oldState = state;
         if (encryptor != null && protocolVersion > 0) {
             encryptor.setPassthroughMode(false);
+            logger.debug("Encryptor passthrough disabled for guild {} (DAVE encryption active)", guildId);
         }
 
         state = State.ESTABLISHED;
         pendingTransitionId = -1;
+        logger.debug("Executed transition {} for guild {} [state: {} -> ESTABLISHED]",
+                transitionId, guildId, oldState);
     }
 
     private void sendTransitionReady(int transitionId) {
@@ -414,15 +465,24 @@ public class DaveSessionManager implements AutoCloseable {
     }
 
     private void resetAndResendKeyPackage() {
+        State oldState = state;
+        logger.debug("Resetting DAVE session for guild {} [oldState={}, protocolVersion={}, "
+                + "recognizedUsers({}): {}]",
+                guildId, oldState, protocolVersion,
+                recognizedUserIds.size(), recognizedUserIds);
         if (encryptor != null) {
             encryptor.setPassthroughMode(true);
+            logger.debug("Encryptor set to passthrough mode for guild {}", guildId);
         }
         if (session != null) {
             session.reset();
             session.init(protocolVersion, guildId, selfUserId);
+            logger.debug("Session reset and re-initialized for guild {} "
+                    + "[NOTE: external sender NOT re-applied after reset]", guildId);
         }
         sendKeyPackage();
         state = State.AWAITING_GROUP;
+        logger.debug("Recovery: sent key package, state {} -> AWAITING_GROUP for guild {}", oldState, guildId);
     }
 
     private void sendBinaryMessage(int opcode, byte[] data) {
