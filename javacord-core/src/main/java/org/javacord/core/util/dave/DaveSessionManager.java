@@ -216,8 +216,10 @@ public class DaveSessionManager implements AutoCloseable {
             }
 
             if (result.isIgnored()) {
-                logger.debug("Ignoring MLS commit for guild {} [transitionId={}, state={}]",
-                        guildId, transitionId, state);
+                logger.warn("MLS commit ignored (group mismatch) for guild {}, resetting session "
+                        + "[transitionId={}, state={}]", guildId, transitionId, state);
+                sendInvalidCommitWelcome(transitionId);
+                resetAndResendKeyPackage();
                 return;
             }
 

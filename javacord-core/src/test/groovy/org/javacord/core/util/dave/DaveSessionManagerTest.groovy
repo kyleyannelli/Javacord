@@ -213,7 +213,7 @@ class DaveSessionManagerTest extends Specification {
             manager.state == DaveSessionManager.State.AWAITING_GROUP
     }
 
-    def 'handleCommitTransition on ignored commit does not transition or send messages'() {
+    def 'handleCommitTransition on ignored commit resets session'() {
         given:
             manager.initialize(PROTOCOL_VERSION, SSRC)
             manager.handleExecuteTransition(0)
@@ -227,8 +227,10 @@ class DaveSessionManagerTest extends Specification {
             manager.handleCommitTransition(payload)
 
         then:
-            0 * sender.sendTextFrame(_)
-            0 * sender.sendBinaryFrame(_)
+            1 * sender.sendTextFrame({ String json ->
+                json.contains('"op":31') && json.contains('"transition_id":1')
+            })
+            manager.state == DaveSessionManager.State.AWAITING_GROUP
     }
 
     def 'handleCommitTransition with too-short payload is a no-op'() {
