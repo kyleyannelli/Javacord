@@ -243,7 +243,7 @@ public class DaveSessionManager implements AutoCloseable {
      */
     public void handleWelcome(byte[] payload) {
         if (session == null || payload.length < 2) {
-            logger.debug("Ignoring welcome for guild {} [session={}, payloadLen={}]",
+            logger.warn("Ignoring welcome for guild {} [session={}, payloadLen={}]",
                     guildId, session != null ? "present" : "null", payload.length);
             return;
         }
@@ -252,7 +252,7 @@ public class DaveSessionManager implements AutoCloseable {
         byte[] welcome = new byte[payload.length - 2];
         System.arraycopy(payload, 2, welcome, 0, welcome.length);
 
-        logger.debug("Processing welcome {} for guild {} [state={}, welcomeDataLen={}, "
+        logger.info("Processing welcome {} for guild {} [state={}, welcomeDataLen={}, "
                 + "recognizedUsers({}): {}]",
                 transitionId, guildId, state, welcome.length,
                 recognizedUserIds.size(), recognizedUserIds);
@@ -271,7 +271,8 @@ public class DaveSessionManager implements AutoCloseable {
             pendingTransitionId = transitionId;
             state = State.TRANSITIONING;
             sendTransitionReady(transitionId);
-            logger.debug("Processed welcome, ready for transition {} in guild {}", transitionId, guildId);
+            logger.info("Processed welcome, sent TRANSITION_READY for transition {} in guild {} "
+                    + "[state={}]", transitionId, guildId, state);
         }
     }
 
@@ -315,7 +316,7 @@ public class DaveSessionManager implements AutoCloseable {
      */
     public void handleExecuteTransition(int transitionId) {
         executeTransitionImmediately(transitionId);
-        logger.debug("Executed transition {} for guild {}", transitionId, guildId);
+        logger.info("Executed transition {} for guild {} [state={}]", transitionId, guildId, state);
     }
 
     /**
