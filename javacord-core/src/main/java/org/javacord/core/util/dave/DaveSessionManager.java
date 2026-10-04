@@ -224,9 +224,13 @@ public class DaveSessionManager implements AutoCloseable {
             }
 
             prepareSenderKeyRatchets();
-            pendingTransitionId = transitionId;
-            state = State.TRANSITIONING;
-            sendTransitionReady(transitionId);
+            if (transitionId == INIT_TRANSITION_ID) {
+                executeTransitionImmediately(transitionId);
+            } else {
+                pendingTransitionId = transitionId;
+                state = State.TRANSITIONING;
+                sendTransitionReady(transitionId);
+            }
             logger.debug("Processed commit, ready for transition {} in guild {}", transitionId, guildId);
         }
     }
@@ -268,9 +272,13 @@ public class DaveSessionManager implements AutoCloseable {
             }
 
             prepareSenderKeyRatchets();
-            pendingTransitionId = transitionId;
-            state = State.TRANSITIONING;
-            sendTransitionReady(transitionId);
+            if (transitionId == INIT_TRANSITION_ID) {
+                executeTransitionImmediately(transitionId);
+            } else {
+                pendingTransitionId = transitionId;
+                state = State.TRANSITIONING;
+                sendTransitionReady(transitionId);
+            }
             logger.info("Processed welcome, sent TRANSITION_READY for transition {} in guild {} "
                     + "[state={}]", transitionId, guildId, state);
         }
