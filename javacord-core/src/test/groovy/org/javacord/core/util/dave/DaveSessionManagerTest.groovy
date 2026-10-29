@@ -752,4 +752,26 @@ class DaveSessionManagerTest extends Specification {
         then:
             !manager.isEncryptionActive()
     }
+
+    def 'a departed member is no longer accepted in welcomes once the group has moved on'() {
+        given:
+            manager.addRecognizedUser(OTHER_USER_ID)
+            manager.removeRecognizedUser(OTHER_USER_ID)
+            establishViaWelcome()
+            String[] forWelcome = null
+            lib.daveSessionProcessCommit(*_) >> FAKE_RESULT_HANDLE
+            lib.daveCommitResultIsFailed(FAKE_RESULT_HANDLE) >> (byte) 1
+            lib.daveCommitResultIsIgnored(FAKE_RESULT_HANDLE) >> (byte) 0
+
+        when: 'after recovery, a new welcome arrives'
+            manager.handleCommitTransition(payload(3, 0x01))
+            manager.handleWelcome(payload(0, 0x01))
+
+        then:
+            1 * lib.daveSessionProcessWelcome(*_) >> { args ->
+                forWelcome = args[3]
+                FAKE_RESULT_HANDLE
+            }
+            forWelcome as List == [SELF_USER_ID]
+    }
 }

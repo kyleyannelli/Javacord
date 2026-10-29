@@ -90,6 +90,7 @@ public class DaveSessionManager implements AutoCloseable {
     /**
      * Users who left (opcode 13) and have not reconnected. They can still be group members until their
      * removal is committed, so a welcome that lists them is accepted; adding them again is not.
+     * Cleared whenever a commit or welcome is applied, so this tolerance lasts only until the group moves on.
      */
     private final Set<String> disconnectedUserIds = new HashSet<>();
 
@@ -412,6 +413,7 @@ public class DaveSessionManager implements AutoCloseable {
      */
     private void onGroupUpdated(int transitionId) {
         reinitializing = false;
+        disconnectedUserIds.clear();
         if (transitionId == INIT_TRANSITION_ID) {
             executeTransition(transitionId, protocolVersion);
         } else {
