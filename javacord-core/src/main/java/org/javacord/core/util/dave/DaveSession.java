@@ -1,7 +1,7 @@
 package org.javacord.core.util.dave;
 
 import com.sun.jna.Pointer;
-import com.sun.jna.ptr.IntByReference;
+import com.sun.jna.ptr.LongByReference;
 import com.sun.jna.ptr.PointerByReference;
 import org.apache.logging.log4j.Logger;
 import org.javacord.core.util.logging.LoggerUtil;
@@ -40,8 +40,12 @@ public class DaveSession implements AutoCloseable {
     /**
      * Initializes the session with protocol version and group information.
      *
+     * <p>Also resets any previous state: libdave's init clears the group and regenerates the
+     * local leaf node, keeping only the external sender. Use this (not {@link #reset()}) to start
+     * over and produce a fresh key package.
+     *
      * @param protocolVersion The DAVE protocol version to use.
-     * @param groupId         The guild/group ID for this voice session.
+     * @param groupId         The MLS group ID: the voice channel ID.
      * @param selfUserId      The bot's own user ID as a string.
      */
     public void init(int protocolVersion, long groupId, String selfUserId) {
@@ -51,6 +55,9 @@ public class DaveSession implements AutoCloseable {
 
     /**
      * Resets all session state, invalidating any existing MLS group.
+     *
+     * <p>This also discards the local leaf node and group ID, so no key package can be produced
+     * until {@link #init(int, long, String)} is called again.
      */
     public void reset() {
         ensureOpen();
@@ -84,7 +91,7 @@ public class DaveSession implements AutoCloseable {
      */
     public void setExternalSender(byte[] externalSenderPackage) {
         ensureOpen();
-        lib.daveSessionSetExternalSender(sessionHandle, externalSenderPackage, externalSenderPackage.length);
+        lib.daveSessionSetExternalSender(sessionHandle, externalSenderPackage, (long) externalSenderPackage.length);
     }
 
     /**
@@ -95,17 +102,9 @@ public class DaveSession implements AutoCloseable {
     public Optional<byte[]> getMarshalledKeyPackage() {
         ensureOpen();
         PointerByReference keyPackagePtr = new PointerByReference();
-        IntByReference lengthRef = new IntByReference();
+        LongByReference lengthRef = new LongByReference();
         lib.daveSessionGetMarshalledKeyPackage(sessionHandle, keyPackagePtr, lengthRef);
-
-        Pointer ptr = keyPackagePtr.getValue();
-        if (ptr == null || lengthRef.getValue() <= 0) {
-            return Optional.empty();
-        }
-
-        byte[] keyPackage = ptr.getByteArray(0, lengthRef.getValue());
-        lib.daveFree(ptr);
-        return Optional.of(keyPackage);
+        return takeBuffer(keyPackagePtr, lengthRef);
     }
 
     /**
@@ -120,21 +119,13 @@ public class DaveSession implements AutoCloseable {
         ensureOpen();
         String[] userIds = recognizedUsers.toArray(new String[0]);
         PointerByReference commitPtr = new PointerByReference();
-        IntByReference lengthRef = new IntByReference();
+        LongByReference lengthRef = new LongByReference();
 
         lib.daveSessionProcessProposals(
                 sessionHandle, proposals, proposals.length,
                 userIds, userIds.length,
                 commitPtr, lengthRef);
-
-        Pointer ptr = commitPtr.getValue();
-        if (ptr == null || lengthRef.getValue() <= 0) {
-            return Optional.empty();
-        }
-
-        byte[] commitWelcome = ptr.getByteArray(0, lengthRef.getValue());
-        lib.daveFree(ptr);
-        return Optional.of(commitWelcome);
+        return takeBuffer(commitPtr, lengthRef);
     }
 
     /**
@@ -145,7 +136,7 @@ public class DaveSession implements AutoCloseable {
      */
     public DaveCommitResult processCommit(byte[] commitData) {
         ensureOpen();
-        Pointer resultHandle = lib.daveSessionProcessCommit(sessionHandle, commitData, commitData.length);
+        Pointer resultHandle = lib.daveSessionProcessCommit(sessionHandle, commitData, (long) commitData.length);
         if (resultHandle == null) {
             return DaveCommitResult.failed();
         }
@@ -174,12 +165,26 @@ public class DaveSession implements AutoCloseable {
     /**
      * Gets a key ratchet for the specified user from the current MLS epoch.
      *
+     * <p>The caller owns the returned handle and must free it with {@link #destroyKeyRatchet(Pointer)}.
+     * Encryptors and decryptors copy ratchets, so it can be destroyed as soon as it has been handed over.
+     *
      * @param userId The user ID string to get a key ratchet for.
-     * @return The native key ratchet handle, or {@code null} if not available.
+     * @return The native key ratchet handle, or {@code null} if there is no established group.
      */
     public Pointer getKeyRatchet(String userId) {
         ensureOpen();
         return lib.daveSessionGetKeyRatchet(sessionHandle, userId);
+    }
+
+    /**
+     * Frees a key ratchet obtained from {@link #getKeyRatchet(String)}.
+     *
+     * @param keyRatchet The key ratchet handle, may be {@code null}.
+     */
+    public void destroyKeyRatchet(Pointer keyRatchet) {
+        if (keyRatchet != null) {
+            lib.daveKeyRatchetDestroy(keyRatchet);
+        }
     }
 
     /**
@@ -190,17 +195,25 @@ public class DaveSession implements AutoCloseable {
     public Optional<byte[]> getLastEpochAuthenticator() {
         ensureOpen();
         PointerByReference authPtr = new PointerByReference();
-        IntByReference lengthRef = new IntByReference();
+        LongByReference lengthRef = new LongByReference();
         lib.daveSessionGetLastEpochAuthenticator(sessionHandle, authPtr, lengthRef);
+        return takeBuffer(authPtr, lengthRef);
+    }
 
-        Pointer ptr = authPtr.getValue();
-        if (ptr == null || lengthRef.getValue() <= 0) {
+    /**
+     * Copies a libdave-allocated output buffer into a Java array and frees it, even when empty.
+     */
+    private Optional<byte[]> takeBuffer(PointerByReference bufferRef, LongByReference lengthRef) {
+        Pointer ptr = bufferRef.getValue();
+        if (ptr == null) {
             return Optional.empty();
         }
-
-        byte[] authenticator = ptr.getByteArray(0, lengthRef.getValue());
-        lib.daveFree(ptr);
-        return Optional.of(authenticator);
+        try {
+            long length = lengthRef.getValue();
+            return length > 0 ? Optional.of(ptr.getByteArray(0, (int) length)) : Optional.empty();
+        } finally {
+            lib.daveFree(ptr);
+        }
     }
 
     private void ensureOpen() {

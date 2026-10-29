@@ -1,7 +1,7 @@
 package org.javacord.core.util.dave;
 
 import com.sun.jna.Pointer;
-import com.sun.jna.ptr.IntByReference;
+import com.sun.jna.ptr.LongByReference;
 import com.sun.jna.ptr.PointerByReference;
 
 import java.util.Collections;
@@ -46,7 +46,7 @@ public class DaveCommitResult implements AutoCloseable {
         if (nativeFailure) {
             return true;
         }
-        return resultHandle != null && lib.daveCommitResultIsFailed(resultHandle);
+        return resultHandle != null && lib.daveCommitResultIsFailed(resultHandle) != 0;
     }
 
     /**
@@ -58,7 +58,7 @@ public class DaveCommitResult implements AutoCloseable {
         if (nativeFailure || resultHandle == null) {
             return false;
         }
-        return lib.daveCommitResultIsIgnored(resultHandle);
+        return lib.daveCommitResultIsIgnored(resultHandle) != 0;
     }
 
     /**
@@ -80,20 +80,21 @@ public class DaveCommitResult implements AutoCloseable {
             return Collections.emptySet();
         }
         PointerByReference idsPtr = new PointerByReference();
-        IntByReference lengthRef = new IntByReference();
+        LongByReference lengthRef = new LongByReference();
         lib.daveCommitResultGetRosterMemberIds(resultHandle, idsPtr, lengthRef);
 
         Pointer ptr = idsPtr.getValue();
-        int count = lengthRef.getValue();
-        if (ptr == null || count <= 0) {
+        if (ptr == null) {
             return Collections.emptySet();
         }
-
-        long[] ids = new long[count];
-        for (int i = 0; i < count; i++) {
-            ids[i] = ptr.getLong((long) i * Long.BYTES);
+        long[] ids;
+        try {
+            // libdave allocates the array even when the roster is empty, so always free it
+            long count = lengthRef.getValue();
+            ids = count > 0 ? ptr.getLongArray(0, (int) count) : new long[0];
+        } finally {
+            lib.daveFree(ptr);
         }
-        lib.daveFree(ptr);
 
         Set<Long> result = new HashSet<>();
         for (long id : ids) {

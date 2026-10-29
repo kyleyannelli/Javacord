@@ -33,7 +33,8 @@ public class Heart {
 
     private final AtomicReference<Future<?>> heartbeatTimer = new AtomicReference<>();
     private final AtomicBoolean heartbeatAckReceived = new AtomicBoolean();
-    private int lastSeq = 0;
+    // -1 means no sequence number received yet (voice gateway v8 expects seq_ack: -1 in that case)
+    private volatile int lastSeq = -1;
 
     // Used to calculate the gateway latency
     private volatile long lastHeartbeatSentTimeNanos = -1;
@@ -65,6 +66,12 @@ public class Heart {
             // For normal websockets, the last sequence number is sent in the heartbeat
             if (packet.has("s") && !packet.get("s").isNull()) {
                 lastSeq = packet.get("s").asInt();
+            }
+        } else {
+            // Voice gateway v8 sends a top-level sequence number which must be acknowledged
+            // in heartbeats and resumes via seq_ack
+            if (packet.has("seq") && !packet.get("seq").isNull()) {
+                lastSeq = packet.get("seq").asInt();
             }
         }
         int heartbeatAckOp = voice ? VoiceGatewayOpcode.HEARTBEAT_ACK.getCode() : GatewayOpcode.HEARTBEAT_ACK.getCode();
@@ -98,9 +105,14 @@ public class Heart {
                         beat();
                     } else {
                         stethoscope.debug("Heartbeat not answered properly. This might be because of a busy websocket");
-                        // closeFrameSender.accept(
-                        //         WebSocketCloseReason.HEARTBEAT_NOT_PROPERLY_ANSWERED.getNumericCloseCode(),
-                        //         WebSocketCloseReason.HEARTBEAT_NOT_PROPERLY_ANSWERED.getCloseReason());
+                        if (voice) {
+                            // ACKs only arrive in reply to beats, so skipping the beat here would leave the
+                            // flag false forever and silently stop all heartbeats until the server times the
+                            // session out. Force a close so the websocket reconnects/resumes promptly instead.
+                            closeFrameSender.accept(
+                                    WebSocketCloseReason.HEARTBEAT_NOT_PROPERLY_ANSWERED.getNumericCloseCode(),
+                                    WebSocketCloseReason.HEARTBEAT_NOT_PROPERLY_ANSWERED.getCloseReason());
+                        }
                     }
                 } catch (Throwable t) {
                     // R.I.P.
@@ -117,13 +129,14 @@ public class Heart {
         ObjectNode heartbeatPacket = JsonNodeFactory.instance.objectNode()
                 .put("op", voice ? VoiceGatewayOpcode.HEARTBEAT.getCode() : GatewayOpcode.HEARTBEAT.getCode());
 
-        // voice gateway v8 puts the beat inside d { t }
+        // voice gateway v8 puts the beat inside d { t, seq_ack }
         if (voice) {
             ObjectNode dataNode = JsonNodeFactory.instance.objectNode()
-                    .put("t", System.currentTimeMillis());
+                    .put("t", System.currentTimeMillis())
+                    .put("seq_ack", lastSeq);
             heartbeatPacket.set("d", dataNode);
         } else {
-            heartbeatPacket.put("d", lastSeq);
+            heartbeatPacket.put("d", Math.max(lastSeq, 0));
         }
 
         WebSocketFrame heartbeatFrame = WebSocketFrame.createTextFrame(heartbeatPacket.toString());
@@ -131,6 +144,31 @@ public class Heart {
         lastHeartbeatSentTimeNanos = System.nanoTime();
         // Ba boom, ba boom, ba boom, ba boom, ...
         stethoscope.debug("Sent heartbeat (voice: {}, packet: {})", voice, heartbeatPacket);
+    }
+
+    /**
+     * Records the sequence number of a voice gateway binary message (its first two bytes, big-endian).
+     *
+     * @param seq The sequence number.
+     */
+    void handleBinarySequence(int seq) {
+        lastSeq = seq;
+    }
+
+    /**
+     * Forgets the last sequence number, for a new (not resumed) session.
+     */
+    void resetSequence() {
+        lastSeq = -1;
+    }
+
+    /**
+     * Gets the last sequence number received from the gateway, or -1 if none was received yet.
+     *
+     * @return The last sequence number.
+     */
+    int getLastSeq() {
+        return lastSeq;
     }
 
     /**

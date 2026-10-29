@@ -2,7 +2,7 @@ package org.javacord.core.util.dave
 
 import com.sun.jna.Memory
 import com.sun.jna.Pointer
-import com.sun.jna.ptr.IntByReference
+import com.sun.jna.ptr.LongByReference
 import com.sun.jna.ptr.PointerByReference
 import spock.lang.Specification
 import spock.lang.Subject
@@ -77,7 +77,7 @@ class DaveSessionTest extends Specification {
             def result = session.getMarshalledKeyPackage()
 
         then:
-            1 * lib.daveSessionGetMarshalledKeyPackage(FAKE_HANDLE, _ as PointerByReference, _ as IntByReference) >> { args ->
+            1 * lib.daveSessionGetMarshalledKeyPackage(FAKE_HANDLE, _ as PointerByReference, _ as LongByReference) >> { args ->
                 args[1].setValue(keyMemory)
                 args[2].setValue(expectedData.length)
             }
@@ -91,7 +91,7 @@ class DaveSessionTest extends Specification {
             def result = session.getMarshalledKeyPackage()
 
         then:
-            1 * lib.daveSessionGetMarshalledKeyPackage(FAKE_HANDLE, _ as PointerByReference, _ as IntByReference)
+            1 * lib.daveSessionGetMarshalledKeyPackage(FAKE_HANDLE, _ as PointerByReference, _ as LongByReference)
             !result.isPresent()
     }
 
@@ -103,11 +103,27 @@ class DaveSessionTest extends Specification {
             def result = session.getMarshalledKeyPackage()
 
         then:
-            1 * lib.daveSessionGetMarshalledKeyPackage(FAKE_HANDLE, _ as PointerByReference, _ as IntByReference) >> { args ->
+            1 * lib.daveSessionGetMarshalledKeyPackage(FAKE_HANDLE, _ as PointerByReference, _ as LongByReference) >> { args ->
                 args[1].setValue(keyMemory)
                 args[2].setValue(0)
             }
             !result.isPresent()
+            1 * lib.daveFree(keyMemory)
+    }
+
+    def 'getKeyRatchet hands out a handle the caller destroys with destroyKeyRatchet'() {
+        given:
+            Pointer ratchet = new Pointer(42L)
+            lib.daveSessionGetKeyRatchet(FAKE_HANDLE, SELF_USER_ID) >> ratchet
+
+        when:
+            def handle = session.getKeyRatchet(SELF_USER_ID)
+            session.destroyKeyRatchet(handle)
+            session.destroyKeyRatchet(null)
+
+        then:
+            handle == ratchet
+            1 * lib.daveKeyRatchetDestroy(ratchet)
     }
 
     def 'processProposals returns commit bytes when available'() {
@@ -123,7 +139,7 @@ class DaveSessionTest extends Specification {
 
         then:
             1 * lib.daveSessionProcessProposals(FAKE_HANDLE, proposals, 2,
-                    _ as String[], 2, _ as PointerByReference, _ as IntByReference) >> { args ->
+                    _ as String[], 2, _ as PointerByReference, _ as LongByReference) >> { args ->
                 args[5].setValue(commitMemory)
                 args[6].setValue(expectedCommit.length)
             }
@@ -142,7 +158,7 @@ class DaveSessionTest extends Specification {
 
         then:
             1 * lib.daveSessionProcessProposals(FAKE_HANDLE, proposals, 1,
-                    _ as String[], 0, _ as PointerByReference, _ as IntByReference)
+                    _ as String[], 0, _ as PointerByReference, _ as LongByReference)
             !result.isPresent()
     }
 

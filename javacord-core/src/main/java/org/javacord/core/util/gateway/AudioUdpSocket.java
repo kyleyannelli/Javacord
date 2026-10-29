@@ -39,12 +39,18 @@ public class AudioUdpSocket {
     private byte[] secretKey;
 
     private volatile DaveFrameEncryptor daveEncryptor;
-    private volatile int daveSsrc;
 
     /**
      * Gets incremented for every packet sent.
      */
     private char sequence = (char) 0;
+
+    /**
+     * The RTP timestamp. Gets incremented by 960 (48kHz * 20ms) for every frame.
+     * Kept separate from {@link #sequence} because the 16-bit sequence wraps every ~21.8 minutes,
+     * which would regress a sequence-derived timestamp to 0 (RFC 3550 requires a monotonic mod-2^32 timestamp).
+     */
+    private int timestamp = 0;
 
     /**
      * Creates a new audio udp socket.
@@ -85,12 +91,10 @@ public class AudioUdpSocket {
      * The encryptor is managed by the {@link org.javacord.core.util.dave.DaveSessionManager} and its key
      * ratchet is updated on MLS epoch transitions.
      *
-     * @param daveEncryptor The DAVE frame encryptor instance.
-     * @param ssrc          The SSRC assigned to this audio stream.
+     * @param daveEncryptor The DAVE frame encryptor instance, or {@code null} to stop DAVE encryption.
      */
-    public void setDaveEncryptor(DaveFrameEncryptor daveEncryptor, int ssrc) {
+    public void setDaveEncryptor(DaveFrameEncryptor daveEncryptor) {
         this.daveEncryptor = daveEncryptor;
-        this.daveSsrc = ssrc;
     }
 
     /**
@@ -138,6 +142,10 @@ public class AudioUdpSocket {
                 boolean dontSleep = true;
                 boolean speaking = false;
                 long framesOfSilenceToPlay = 5;
+                long droppedFrames = 0;
+                long lastDropLogNanos = 0;
+                long underruns = 0;
+                long lastUnderrunLogNanos = 0;
                 while (shouldSend) {
                     // Get the current audio source. If none is available, it will block the thread
                     AudioSource source = connection.getCurrentAudioSourceBlocking();
@@ -166,6 +174,17 @@ public class AudioUdpSocket {
                     // If the source is muted, replace the frame with a muted frame
                     if (source.isMuted()) {
                         frame = null;
+                    } else if (frame == null && speaking) {
+                        // The source ran dry mid-playback (e.g. its upstream buffer drained) and we are
+                        // about to send silence instead of audio. Log rate-limited so starvation is
+                        // diagnosable from production logs.
+                        underruns++;
+                        if (System.nanoTime() - lastUnderrunLogNanos >= 5_000_000_000L) {
+                            logger.warn("Audio source underrun; sent {} silent frame(s) mid-playback ({})",
+                                    underruns, connection);
+                            underruns = 0;
+                            lastUnderrunLogNanos = System.nanoTime();
+                        }
                     }
 
                     if (frame != null || framesOfSilenceToPlay > 0) {
@@ -178,20 +197,32 @@ public class AudioUdpSocket {
                                 ? frame : SilentAudioSource.SILENCE_FRAME;
                         DaveFrameEncryptor currentDaveEncryptor = daveEncryptor;
                         if (currentDaveEncryptor != null) {
+                            // In passthrough (no group yet, re-initializing, or protocol version 0) the frame is
+                            // returned as is. Empty means libdave refused to encrypt (e.g. no key ratchet), so
+                            // drop it rather than send plaintext where E2EE is expected.
                             Optional<byte[]> daveEncrypted =
-                                    currentDaveEncryptor.encrypt(daveSsrc, frameForPacket);
-                            if (daveEncrypted.isPresent()) {
-                                frameForPacket = daveEncrypted.get();
+                                    currentDaveEncryptor.encrypt(ssrc, frameForPacket);
+                            frameForPacket = daveEncrypted.orElse(null);
+                            if (frameForPacket == null) {
+                                droppedFrames++;
+                                if (System.nanoTime() - lastDropLogNanos >= 5_000_000_000L) {
+                                    logger.warn("DAVE could not encrypt; dropped {} audio frame(s) ({})",
+                                            droppedFrames, connection);
+                                    droppedFrames = 0;
+                                    lastDropLogNanos = System.nanoTime();
+                                }
                             }
                         }
 
-                        packet = new AudioPacket(
-                                frameForPacket,
-                                sequence,
-                                ((int) sequence * 960),
-                                ssrc,
-                                this.audioEncryptor
-                        );
+                        if (frameForPacket != null) {
+                            packet = new AudioPacket(
+                                    frameForPacket,
+                                    sequence,
+                                    timestamp,
+                                    ssrc,
+                                    this.audioEncryptor
+                            );
+                        }
 
                         if (frame == null) {
                             framesOfSilenceToPlay--;
@@ -207,6 +238,7 @@ public class AudioUdpSocket {
                     nextFrameTimestamp = nextFrameTimestamp + 20_000_000;
 
                     sequence++;
+                    timestamp += 960;
 
                     if (packet != null) {
                         try {

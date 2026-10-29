@@ -1,6 +1,9 @@
 package org.javacord.core.util.dave
 
+import com.sun.jna.Memory
 import com.sun.jna.Pointer
+import com.sun.jna.ptr.LongByReference
+import com.sun.jna.ptr.PointerByReference
 import spock.lang.Specification
 import spock.lang.Subject
 
@@ -24,7 +27,7 @@ class DaveCommitResultTest extends Specification {
     def 'isFailed delegates to native when not a native failure'() {
         given:
             def result = new DaveCommitResult(lib, FAKE_HANDLE)
-            lib.daveCommitResultIsFailed(FAKE_HANDLE) >> true
+            lib.daveCommitResultIsFailed(FAKE_HANDLE) >> (byte) 1
 
         expect:
             result.isFailed()
@@ -33,8 +36,8 @@ class DaveCommitResultTest extends Specification {
     def 'isIgnored delegates to native'() {
         given:
             def result = new DaveCommitResult(lib, FAKE_HANDLE)
-            lib.daveCommitResultIsFailed(FAKE_HANDLE) >> false
-            lib.daveCommitResultIsIgnored(FAKE_HANDLE) >> true
+            lib.daveCommitResultIsFailed(FAKE_HANDLE) >> (byte) 0
+            lib.daveCommitResultIsIgnored(FAKE_HANDLE) >> (byte) 1
 
         expect:
             result.isIgnored()
@@ -43,8 +46,8 @@ class DaveCommitResultTest extends Specification {
     def 'isSuccess returns true when not failed and not ignored'() {
         given:
             def result = new DaveCommitResult(lib, FAKE_HANDLE)
-            lib.daveCommitResultIsFailed(FAKE_HANDLE) >> false
-            lib.daveCommitResultIsIgnored(FAKE_HANDLE) >> false
+            lib.daveCommitResultIsFailed(FAKE_HANDLE) >> (byte) 0
+            lib.daveCommitResultIsIgnored(FAKE_HANDLE) >> (byte) 0
 
         expect:
             result.isSuccess()
@@ -78,5 +81,41 @@ class DaveCommitResultTest extends Specification {
 
         expect:
             result.getRosterMemberIds().isEmpty()
+    }
+
+    def 'getRosterMemberIds reads uint64 ids and frees the native array'() {
+        given:
+            Memory ids = new Memory(16)
+            ids.setLong(0, 111L)
+            ids.setLong(8, 222L)
+            def result = new DaveCommitResult(lib, FAKE_HANDLE)
+
+        when:
+            def roster = result.getRosterMemberIds()
+
+        then:
+            1 * lib.daveCommitResultGetRosterMemberIds(FAKE_HANDLE, _ as PointerByReference, _ as LongByReference) >> { args ->
+                args[1].setValue(ids)
+                args[2].setValue(2L)
+            }
+            1 * lib.daveFree(ids)
+            roster == [111L, 222L] as Set
+    }
+
+    def 'getRosterMemberIds frees the native array even when the roster is empty'() {
+        given:
+            Memory ids = new Memory(1)
+            def result = new DaveCommitResult(lib, FAKE_HANDLE)
+
+        when:
+            def roster = result.getRosterMemberIds()
+
+        then:
+            1 * lib.daveCommitResultGetRosterMemberIds(FAKE_HANDLE, _ as PointerByReference, _ as LongByReference) >> { args ->
+                args[1].setValue(ids)
+                args[2].setValue(0L)
+            }
+            1 * lib.daveFree(ids)
+            roster.isEmpty()
     }
 }

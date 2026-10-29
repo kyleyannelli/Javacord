@@ -1,12 +1,15 @@
 package org.javacord.core.util.dave
 
 import com.sun.jna.Pointer
-import com.sun.jna.ptr.IntByReference
+import com.sun.jna.ptr.LongByReference
 import spock.lang.Specification
 import spock.lang.Subject
 
 @Subject(DaveFrameDecryptor)
 class DaveFrameDecryptorTest extends Specification {
+
+    static final Byte PT_ON = 1 as Byte
+    static final Byte PT_OFF = 0 as Byte
 
     static final Pointer FAKE_HANDLE = new Pointer(1L)
     static final Pointer FAKE_KEY_RATCHET = new Pointer(2L)
@@ -30,7 +33,7 @@ class DaveFrameDecryptorTest extends Specification {
 
         then:
             1 * lib.daveDecryptorDecrypt(FAKE_HANDLE, MEDIA_TYPE_AUDIO,
-                    encrypted, 4, _ as byte[], 16, _ as IntByReference) >> { args ->
+                    encrypted, 4, _ as byte[], 16, _ as LongByReference) >> { args ->
                 args[6].setValue(3)
                 return 0
             }
@@ -48,7 +51,7 @@ class DaveFrameDecryptorTest extends Specification {
 
         then:
             1 * lib.daveDecryptorDecrypt(FAKE_HANDLE, MEDIA_TYPE_AUDIO,
-                    encrypted, 1, _ as byte[], 8, _ as IntByReference) >> 1
+                    encrypted, 1, _ as byte[], 8, _ as LongByReference) >> 1
             !result.isPresent()
     }
 
@@ -62,7 +65,7 @@ class DaveFrameDecryptorTest extends Specification {
 
         then:
             1 * lib.daveDecryptorDecrypt(FAKE_HANDLE, MEDIA_TYPE_AUDIO,
-                    encrypted, 1, _ as byte[], 8, _ as IntByReference) >> { args ->
+                    encrypted, 1, _ as byte[], 8, _ as LongByReference) >> { args ->
                 args[6].setValue(0)
                 return 0
             }
@@ -82,13 +85,13 @@ class DaveFrameDecryptorTest extends Specification {
             decryptor.transitionToPassthroughMode(true)
 
         then:
-            1 * lib.daveDecryptorTransitionToPassthroughMode(FAKE_HANDLE, true)
+            1 * lib.daveDecryptorTransitionToPassthroughMode(FAKE_HANDLE, PT_ON)
 
         when:
             decryptor.transitionToPassthroughMode(false)
 
         then:
-            1 * lib.daveDecryptorTransitionToPassthroughMode(FAKE_HANDLE, false)
+            1 * lib.daveDecryptorTransitionToPassthroughMode(FAKE_HANDLE, PT_OFF)
     }
 
     def 'close destroys native handle'() {

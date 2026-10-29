@@ -4,44 +4,63 @@ import com.sun.jna.Pointer;
 import org.apache.logging.log4j.Logger;
 import org.javacord.core.util.logging.LoggerUtil;
 
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 
 /**
  * Orchestrates the full DAVE E2EE protocol lifecycle for a single voice connection.
  *
  * <p>Manages the MLS session state machine, frame encryptor/decryptor, recognized
- * user tracking, and epoch transitions. All DAVE voice gateway opcodes are routed
+ * user tracking, and transitions. All DAVE voice gateway opcodes are routed
  * through this manager.
  *
  * <p>The state machine progresses through:
  * <ul>
- *   <li>{@link State#INACTIVE} - No DAVE (protocol version 0 or libdave unavailable)</li>
- *   <li>{@link State#PENDING} - Waiting for external sender and key package exchange</li>
- *   <li>{@link State#AWAITING_GROUP} - Key package sent, waiting for welcome or own commit</li>
- *   <li>{@link State#ESTABLISHED} - MLS group active, sender key ratchets available</li>
- *   <li>{@link State#TRANSITIONING} - Epoch change in progress</li>
+ *   <li>{@link State#INACTIVE} - Not initialized, or closed</li>
+ *   <li>{@link State#AWAITING_GROUP} - Key package sent, waiting for a welcome or our own commit</li>
+ *   <li>{@link State#TRANSITIONING} - Group updated, waiting for the gateway to execute the transition</li>
+ *   <li>{@link State#ESTABLISHED} - Sending with the current epoch's key ratchet</li>
+ *   <li>{@link State#PASSTHROUGH} - Downgraded to protocol version 0, frames pass through</li>
  * </ul>
+ *
+ * <p>Voice readiness never waits for this state machine: as in the reference clients, audio may be
+ * sent right after the session description and is passed through until a transition executes.
+ *
+ * <p>Methods are synchronized: gateway messages arrive on the websocket thread, but {@link #close()}
+ * may be called from any thread.
+ *
+ * @see <a href="https://daveprotocol.com">DAVE Protocol Specification</a>
  */
 public class DaveSessionManager implements AutoCloseable {
 
     private static final Logger logger = LoggerUtil.getLogger(DaveSessionManager.class);
 
+    /**
+     * Transition ID 0 means (re)initialization: execute immediately, never send transition ready.
+     */
     private static final int INIT_TRANSITION_ID = 0;
+
+    private static final int OP_TRANSITION_READY = 23;
+    private static final int OP_MLS_KEY_PACKAGE = 26;
+    private static final int OP_MLS_COMMIT_WELCOME = 28;
+    private static final int OP_MLS_INVALID_COMMIT_WELCOME = 31;
 
     /**
      * The possible states of the DAVE session lifecycle.
      */
     public enum State {
         INACTIVE,
-        PENDING,
         AWAITING_GROUP,
+        TRANSITIONING,
         ESTABLISHED,
-        TRANSITIONING
+        PASSTHROUGH
     }
 
-    private final long guildId;
+    private final LongSupplier groupIdSupplier;
     private final String selfUserId;
     private final VoiceGatewaySender gatewaySender;
 
@@ -51,12 +70,28 @@ public class DaveSessionManager implements AutoCloseable {
     private DaveFrameDecryptor decryptor;
 
     private volatile State state = State.INACTIVE;
-    private volatile int protocolVersion;
-    private volatile int pendingTransitionId = -1;
-    private int ssrc;
-    private byte[] lastExternalSender;
+    private int protocolVersion;
 
-    private final Set<String> recognizedUserIds = ConcurrentHashMap.newKeySet();
+    /**
+     * Announced but not yet executed transitions: transition ID to the protocol version it moves to.
+     */
+    private final Map<Integer, Integer> pendingTransitions = new HashMap<>();
+
+    /**
+     * Set while recovering from an invalid commit/welcome, so a burst of failures sends op 31 only once.
+     */
+    private boolean reinitializing;
+
+    /**
+     * Users in the media session (opcode 11). Add proposals for anyone else are refused.
+     */
+    private final Set<String> recognizedUserIds = new HashSet<>();
+
+    /**
+     * Users who left (opcode 13) and have not reconnected. They can still be group members until their
+     * removal is committed, so a welcome that lists them is accepted; adding them again is not.
+     */
+    private final Set<String> disconnectedUserIds = new HashSet<>();
 
     /**
      * Callback interface for sending voice gateway messages.
@@ -84,29 +119,32 @@ public class DaveSessionManager implements AutoCloseable {
     /**
      * Creates a new DAVE session manager.
      *
-     * @param guildId       The guild ID for this voice session.
-     * @param selfUserId    The bot's own user ID as a string.
-     * @param gatewaySender Callback for sending voice gateway messages.
+     * @param groupIdSupplier Supplies the MLS group ID: the current voice channel ID. Read on every
+     *                        (re)initialization, so a moved connection joins the new channel's group.
+     * @param selfUserId      The bot's own user ID as a string.
+     * @param gatewaySender   Callback for sending voice gateway messages.
      */
-    public DaveSessionManager(long guildId, String selfUserId, VoiceGatewaySender gatewaySender) {
-        this(guildId, selfUserId, gatewaySender, LibDaveLoader.getInstance());
+    public DaveSessionManager(LongSupplier groupIdSupplier, String selfUserId, VoiceGatewaySender gatewaySender) {
+        this(groupIdSupplier, selfUserId, gatewaySender, LibDaveLoader.getInstance());
     }
 
-    DaveSessionManager(long guildId, String selfUserId, VoiceGatewaySender gatewaySender, LibDave lib) {
-        this.guildId = guildId;
+    DaveSessionManager(LongSupplier groupIdSupplier, String selfUserId, VoiceGatewaySender gatewaySender,
+                       LibDave lib) {
+        this.groupIdSupplier = groupIdSupplier;
         this.selfUserId = selfUserId;
         this.gatewaySender = gatewaySender;
         this.lib = lib;
+        recognizedUserIds.add(selfUserId);
     }
 
     /**
      * Initializes the DAVE session after receiving a non-zero {@code dave_protocol_version}
-     * in the SESSION_DESCRIPTION (opcode 4) response.
+     * in the SESSION_DESCRIPTION (opcode 4) response, and sends our key package.
      *
      * @param protocolVersion The DAVE protocol version selected by the voice gateway.
      * @param ssrc            The SSRC assigned to this client.
      */
-    public void initialize(int protocolVersion, int ssrc) {
+    public synchronized void initialize(int protocolVersion, int ssrc) {
         if (lib == null) {
             logger.error("Cannot initialize DAVE session: libdave not available. "
                     + "Install libdave on your system to use voice channels with E2EE.");
@@ -114,275 +152,209 @@ public class DaveSessionManager implements AutoCloseable {
             return;
         }
 
-        this.protocolVersion = protocolVersion;
-        this.ssrc = ssrc;
-
         cleanup();
         session = new DaveSession(lib);
-        session.init(protocolVersion, guildId, selfUserId);
         encryptor = new DaveFrameEncryptor(lib);
-        encryptor.setPassthroughMode(true);
         encryptor.assignSsrcToOpus(ssrc);
         decryptor = new DaveFrameDecryptor(lib);
         decryptor.transitionToPassthroughMode(true);
 
-        state = State.PENDING;
-        logger.debug("DAVE session initialized with protocol version {} for guild {}", protocolVersion, guildId);
+        this.protocolVersion = protocolVersion;
+        reinit();
+        logger.debug("DAVE session initialized with protocol version {} for group {}",
+                protocolVersion, groupIdSupplier.getAsLong());
     }
 
     /**
      * Handles the MLS external sender package (opcode 25, binary).
      *
-     * <p>Sets the external sender on the MLS session and generates a key package
-     * to send to the voice gateway.
+     * <p>libdave keeps the external sender across re-initializations and creates its pending
+     * group from it.
      *
      * @param externalSenderData The raw binary payload after the opcode/sequence header.
      */
-    public void handleExternalSender(byte[] externalSenderData) {
-        if (state == State.INACTIVE || session == null) {
+    public synchronized void handleExternalSender(byte[] externalSenderData) {
+        if (session == null) {
             return;
         }
-
-        State oldState = state;
-        lastExternalSender = externalSenderData.clone();
+        if (state == State.ESTABLISHED || state == State.TRANSITIONING) {
+            // libdave refuses to replace the external sender of an existing group
+            logger.debug("Ignoring external sender for group {}: already in an MLS group [state={}]",
+                    groupIdSupplier.getAsLong(), state);
+            return;
+        }
         session.setExternalSender(externalSenderData);
-        sendKeyPackage();
-        state = State.AWAITING_GROUP;
-        logger.debug("Received external sender ({} bytes), sent key package for guild {} "
-                + "[state: {} -> AWAITING_GROUP, recognizedUsers: {}]",
-                externalSenderData.length, guildId, oldState, recognizedUserIds.size());
+        logger.debug("Set external sender ({} bytes) for group {} [state={}]",
+                externalSenderData.length, groupIdSupplier.getAsLong(), state);
     }
 
     /**
      * Handles MLS proposals from the voice gateway (opcode 27, binary).
      *
-     * <p>Processes the proposals and, if this client is a committing member,
-     * generates and sends a commit/welcome message.
+     * <p>Processes the proposals against the pending or established group and, if a commit
+     * results, sends it (opcode 28). This is also how the first member creates the group.
      *
      * @param proposalsData The raw binary proposals payload.
      */
-    public void handleProposals(byte[] proposalsData) {
-        if (session == null || state != State.ESTABLISHED) {
-            logger.debug("Ignoring proposals for guild {} [session={}, state={}]",
-                    guildId, session != null ? "present" : "null", state);
+    public synchronized void handleProposals(byte[] proposalsData) {
+        if (session == null || state == State.INACTIVE) {
             return;
         }
-
-        logger.debug("Processing proposals for guild {} [recognizedUsers({}): {}]",
-                guildId, recognizedUserIds.size(), recognizedUserIds);
         Optional<byte[]> commitWelcome = session.processProposals(proposalsData, recognizedUserIds);
         commitWelcome.ifPresent(bytes -> {
-            sendBinaryMessage(28, bytes);
-            logger.debug("Processed proposals and sent commit/welcome for guild {}", guildId);
+            sendBinaryMessage(OP_MLS_COMMIT_WELCOME, bytes);
+            logger.debug("Processed proposals and sent commit/welcome for group {}", groupIdSupplier.getAsLong());
         });
     }
 
     /**
      * Handles an MLS commit transition from the voice gateway (opcode 29, binary).
      *
-     * <p>Processes the commit and prepares new key ratchets for the next epoch.
-     * The payload format after stripping the 3-byte server header is:
+     * <p>The payload format after stripping the 3-byte server header is:
      * {@code [uint16 transition_id][MLS commit data...]}.
      *
      * @param payload The binary payload containing transition ID and MLS commit data.
      */
-    public void handleCommitTransition(byte[] payload) {
+    public synchronized void handleCommitTransition(byte[] payload) {
         if (session == null || payload.length < 2) {
-            logger.debug("Ignoring commit transition for guild {} [session={}, payloadLen={}]",
-                    guildId, session != null ? "present" : "null", payload.length);
             return;
         }
-        if (state != State.ESTABLISHED && state != State.TRANSITIONING) {
-            logger.debug("Ignoring commit transition for guild {} [state={}, expected ESTABLISHED or TRANSITIONING]",
-                    guildId, state);
-            return;
-        }
-
-        int transitionId = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
+        int transitionId = readTransitionId(payload);
         byte[] commitData = new byte[payload.length - 2];
         System.arraycopy(payload, 2, commitData, 0, commitData.length);
 
-        logger.debug("Processing commit transition {} for guild {} [state={}, commitDataLen={}]",
-                transitionId, guildId, state, commitData.length);
-
         try (DaveCommitResult result = session.processCommit(commitData)) {
-            if (result.isFailed()) {
-                logger.warn("Failed to process MLS commit for guild {}, sending invalid commit "
-                        + "[transitionId={}, state={}, recognizedUsers({}): {}]",
-                        guildId, transitionId, state, recognizedUserIds.size(), recognizedUserIds);
-                sendInvalidCommitWelcome(transitionId);
-                resetAndResendKeyPackage();
-                return;
-            }
-
             if (result.isIgnored()) {
-                logger.warn("MLS commit ignored (group mismatch) for guild {}, resetting session "
-                        + "[transitionId={}, state={}]", guildId, transitionId, state);
-                sendInvalidCommitWelcome(transitionId);
-                resetAndResendKeyPackage();
+                // libdave: a commit that arrives while we have no state at all (e.g. mid-reset);
+                // requesting a reset for it would only cause thrashing
+                logger.debug("Ignoring MLS commit for transition {} in group {} [state={}]",
+                        transitionId, groupIdSupplier.getAsLong(), state);
                 return;
             }
-
-            prepareSenderKeyRatchets();
-            if (transitionId == INIT_TRANSITION_ID) {
-                executeTransitionImmediately(transitionId);
-            } else {
-                pendingTransitionId = transitionId;
-                state = State.TRANSITIONING;
-                sendTransitionReady(transitionId);
+            if (result.isFailed()) {
+                logger.warn("Failed to process MLS commit for transition {} in group {}, requesting re-add "
+                        + "[state={}]", transitionId, groupIdSupplier.getAsLong(), state);
+                recoverFromInvalidCommitWelcome(transitionId);
+                return;
             }
-            logger.debug("Processed commit, ready for transition {} in guild {}", transitionId, guildId);
         }
+        onGroupUpdated(transitionId);
     }
 
     /**
      * Handles an MLS welcome message (opcode 30, binary).
      *
-     * <p>Processes the welcome to join an existing MLS group and prepares
-     * key ratchets for decryption.
-     * The payload format after stripping the 3-byte server header is:
+     * <p>The payload format after stripping the 3-byte server header is:
      * {@code [uint16 transition_id][MLS welcome data...]}.
      *
      * @param payload The binary payload containing transition ID and MLS welcome data.
      */
-    public void handleWelcome(byte[] payload) {
+    public synchronized void handleWelcome(byte[] payload) {
         if (session == null || payload.length < 2) {
-            logger.warn("Ignoring welcome for guild {} [session={}, payloadLen={}]",
-                    guildId, session != null ? "present" : "null", payload.length);
             return;
         }
-
-        int transitionId = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
+        int transitionId = readTransitionId(payload);
         byte[] welcome = new byte[payload.length - 2];
         System.arraycopy(payload, 2, welcome, 0, welcome.length);
 
-        logger.info("Processing welcome {} for guild {} [state={}, welcomeDataLen={}, "
-                + "recognizedUsers({}): {}]",
-                transitionId, guildId, state, welcome.length,
-                recognizedUserIds.size(), recognizedUserIds);
-
-        try (DaveWelcomeResult result = session.processWelcome(welcome, recognizedUserIds)) {
+        Set<String> knownMembers = new HashSet<>(recognizedUserIds);
+        knownMembers.addAll(disconnectedUserIds);
+        try (DaveWelcomeResult result = session.processWelcome(welcome, knownMembers)) {
             if (result.isFailed()) {
-                logger.warn("Failed to process MLS welcome for guild {}, sending invalid commit "
-                        + "[transitionId={}, state={}, recognizedUsers({}): {}]",
-                        guildId, transitionId, state, recognizedUserIds.size(), recognizedUserIds);
-                sendInvalidCommitWelcome(transitionId);
-                resetAndResendKeyPackage();
+                logger.warn("Failed to process MLS welcome for transition {} in group {}, requesting re-add "
+                        + "[state={}, recognizedUsers={}]",
+                        transitionId, groupIdSupplier.getAsLong(), state, recognizedUserIds);
+                recoverFromInvalidCommitWelcome(transitionId);
                 return;
             }
-
-            prepareSenderKeyRatchets();
-            if (transitionId == INIT_TRANSITION_ID) {
-                executeTransitionImmediately(transitionId);
-            } else {
-                pendingTransitionId = transitionId;
-                state = State.TRANSITIONING;
-                sendTransitionReady(transitionId);
-            }
-            logger.info("Processed welcome, sent TRANSITION_READY for transition {} in guild {} "
-                    + "[state={}]", transitionId, guildId, state);
         }
+        onGroupUpdated(transitionId);
     }
 
     /**
      * Handles the prepare transition opcode (opcode 21, JSON).
      *
-     * <p>Announces an upcoming protocol version transition. When transitioning
-     * to version 0, enables passthrough mode on the encryptor/decryptor.
+     * <p>Announces a protocol version change. A downgrade to version 0 immediately lets the
+     * receive side accept unencrypted frames; the send side switches when the transition executes.
      *
      * @param transitionProtocolVersion The target protocol version.
      * @param transitionId              The transition ID.
      */
-    public void handlePrepareTransition(int transitionProtocolVersion, int transitionId) {
+    public synchronized void handlePrepareTransition(int transitionProtocolVersion, int transitionId) {
+        if (session == null) {
+            return;
+        }
         if (transitionProtocolVersion == 0) {
-            if (encryptor != null) {
-                encryptor.setPassthroughMode(true);
-            }
-            if (decryptor != null) {
-                decryptor.transitionToPassthroughMode(true);
-            }
+            decryptor.transitionToPassthroughMode(true);
         }
-
         if (transitionId == INIT_TRANSITION_ID) {
-            executeTransitionImmediately(transitionId);
+            executeTransition(transitionId, transitionProtocolVersion);
         } else {
-            pendingTransitionId = transitionId;
-            sendTransitionReady(transitionId);
+            pendingTransitions.put(transitionId, transitionProtocolVersion);
+            sendTransitionMessage(OP_TRANSITION_READY, transitionId);
         }
-
-        logger.debug("Prepared transition {} to protocol version {} for guild {}",
-                transitionId, transitionProtocolVersion, guildId);
+        logger.debug("Prepared transition {} to protocol version {} for group {}",
+                transitionId, transitionProtocolVersion, groupIdSupplier.getAsLong());
     }
 
     /**
      * Handles the execute transition opcode (opcode 22, JSON).
      *
-     * <p>Executes the previously announced transition, applying new sender key
-     * ratchets to the encryptor.
-     *
      * @param transitionId The transition ID to execute.
      */
-    public void handleExecuteTransition(int transitionId) {
-        executeTransitionImmediately(transitionId);
-        logger.info("Executed transition {} for guild {} [state={}]", transitionId, guildId, state);
+    public synchronized void handleExecuteTransition(int transitionId) {
+        if (session == null) {
+            return;
+        }
+        Integer version = pendingTransitions.remove(transitionId);
+        if (version == null) {
+            logger.warn("Received execute for unknown transition {} in group {} [pending={}, state={}]",
+                    transitionId, groupIdSupplier.getAsLong(), pendingTransitions.keySet(), state);
+            return;
+        }
+        executeTransition(transitionId, version);
     }
 
     /**
      * Handles the prepare epoch opcode (opcode 24, JSON).
      *
-     * <p>When epoch is 1, resets the MLS session and sends a new key package
-     * to create or re-create the MLS group.
+     * <p>Epoch 1 means a new group: reset local MLS state and send a fresh key package.
+     * Later epochs need no action here; the group moves on through commits.
      *
      * @param epoch           The epoch ID.
      * @param protocolVersion The protocol version for the new epoch.
      */
-    public void handlePrepareEpoch(long epoch, int protocolVersion) {
-        State oldState = state;
-        this.protocolVersion = protocolVersion;
-
+    public synchronized void handlePrepareEpoch(long epoch, int protocolVersion) {
+        if (session == null) {
+            return;
+        }
         if (epoch == 1) {
-            if (session != null) {
-                session.reset();
-                session.setProtocolVersion(protocolVersion);
-                if (lastExternalSender != null) {
-                    session.setExternalSender(lastExternalSender);
-                }
-                logger.debug("Session reset for epoch 1 in guild {} [externalSender={}]",
-                        guildId, lastExternalSender != null ? "restored" : "none");
-            }
-            sendKeyPackage();
-            state = State.AWAITING_GROUP;
-            logger.debug("Reset MLS group for epoch 1 in guild {} [state: {} -> AWAITING_GROUP]",
-                    guildId, oldState);
+            this.protocolVersion = protocolVersion;
+            reinit();
         } else {
-            logger.debug("Prepare epoch {} for guild {} [state={}, protocolVersion={}]",
-                    epoch, guildId, state, protocolVersion);
+            logger.debug("Prepare epoch {} (protocol version {}) for group {} [state={}]",
+                    epoch, protocolVersion, groupIdSupplier.getAsLong(), state);
         }
     }
 
     /**
-     * Registers a user as a recognized voice session participant.
+     * Registers a user as a recognized voice session participant (opcode 11, or the channel cache).
      *
      * @param userId The user ID string.
      */
-    public void addRecognizedUser(String userId) {
-        boolean added = recognizedUserIds.add(userId);
-        if (added) {
-            logger.debug("Added recognized user {} for guild {} [total: {}]",
-                    userId, guildId, recognizedUserIds.size());
-        }
+    public synchronized void addRecognizedUser(String userId) {
+        recognizedUserIds.add(userId);
+        disconnectedUserIds.remove(userId);
     }
 
     /**
-     * Removes a user from the recognized voice session participants.
+     * Removes a user from the recognized voice session participants (opcode 13).
      *
      * @param userId The user ID string.
      */
-    public void removeRecognizedUser(String userId) {
-        boolean removed = recognizedUserIds.remove(userId);
-        if (removed) {
-            logger.debug("Removed recognized user {} for guild {} [total: {}]",
-                    userId, guildId, recognizedUserIds.size());
+    public synchronized void removeRecognizedUser(String userId) {
+        if (!userId.equals(selfUserId) && recognizedUserIds.remove(userId)) {
+            disconnectedUserIds.add(userId);
         }
     }
 
@@ -391,7 +363,7 @@ public class DaveSessionManager implements AutoCloseable {
      *
      * @return The encryptor, or {@code null} if DAVE is not active.
      */
-    public DaveFrameEncryptor getEncryptor() {
+    public synchronized DaveFrameEncryptor getEncryptor() {
         return encryptor;
     }
 
@@ -400,7 +372,7 @@ public class DaveSessionManager implements AutoCloseable {
      *
      * @return The decryptor, or {@code null} if DAVE is not active.
      */
-    public DaveFrameDecryptor getDecryptor() {
+    public synchronized DaveFrameDecryptor getDecryptor() {
         return decryptor;
     }
 
@@ -418,7 +390,7 @@ public class DaveSessionManager implements AutoCloseable {
      *
      * @return {@code true} if the session is established and encryption is active.
      */
-    public boolean isEncryptionActive() {
+    public synchronized boolean isEncryptionActive() {
         return state == State.ESTABLISHED
                 && encryptor != null
                 && encryptor.hasKeyRatchet()
@@ -426,82 +398,122 @@ public class DaveSessionManager implements AutoCloseable {
     }
 
     /**
-     * Returns whether DAVE E2EE is supported (libdave loaded and protocol version non-zero).
+     * Returns whether DAVE E2EE is negotiated for this session (libdave loaded and protocol version non-zero).
      *
-     * @return {@code true} if DAVE is available for this session.
+     * @return {@code true} if DAVE is active for this session.
      */
-    public boolean isDaveActive() {
-        return state != State.INACTIVE && protocolVersion > 0;
+    public synchronized boolean isDaveActive() {
+        return session != null && protocolVersion > 0;
     }
 
-    private void sendKeyPackage() {
-        if (session == null) {
-            logger.debug("Cannot send key package for guild {}: session is null", guildId);
-            return;
-        }
-        Optional<byte[]> keyPackage = session.getMarshalledKeyPackage();
-        if (keyPackage.isPresent()) {
-            sendBinaryMessage(26, keyPackage.get());
-            logger.debug("Sent key package ({} bytes) for guild {}", keyPackage.get().length, guildId);
+    /**
+     * Called after a commit or welcome was applied: the transition either executes now (ID 0)
+     * or once the gateway sends execute transition (opcode 22).
+     */
+    private void onGroupUpdated(int transitionId) {
+        reinitializing = false;
+        if (transitionId == INIT_TRANSITION_ID) {
+            executeTransition(transitionId, protocolVersion);
         } else {
-            logger.warn("Failed to generate key package for guild {} [state={}]", guildId, state);
+            pendingTransitions.put(transitionId, protocolVersion);
+            state = State.TRANSITIONING;
+            sendTransitionMessage(OP_TRANSITION_READY, transitionId);
+            logger.debug("MLS group updated, sent transition ready for {} in group {}",
+                    transitionId, groupIdSupplier.getAsLong());
         }
     }
 
-    private void prepareSenderKeyRatchets() {
-        if (session == null) {
+    /**
+     * Switches the send side to the given protocol version: the current epoch's key ratchet,
+     * or passthrough for version 0.
+     */
+    private void executeTransition(int transitionId, int version) {
+        State oldState = state;
+        protocolVersion = version;
+        reinitializing = false;
+
+        if (version == 0) {
+            encryptor.setPassthroughMode(true);
+            decryptor.transitionToPassthroughMode(true);
+            state = State.PASSTHROUGH;
+            logger.info("DAVE downgraded to passthrough (transition {}) for group {}",
+                    transitionId, groupIdSupplier.getAsLong());
             return;
         }
 
         Pointer selfRatchet = session.getKeyRatchet(selfUserId);
-        if (selfRatchet != null && encryptor != null) {
+        if (selfRatchet == null) {
+            // No established group (e.g. an initial transition before any welcome): keep passing through
+            logger.warn("Cannot execute transition {} for group {}: no MLS group yet, staying in passthrough "
+                    + "[state={}]", transitionId, groupIdSupplier.getAsLong(), state);
+            return;
+        }
+        try {
             encryptor.setKeyRatchet(selfRatchet);
+        } finally {
+            session.destroyKeyRatchet(selfRatchet);
         }
-    }
-
-    private void executeTransitionImmediately(int transitionId) {
-        State oldState = state;
-        if (encryptor != null && protocolVersion > 0) {
-            encryptor.setPassthroughMode(false);
-            logger.debug("Encryptor passthrough disabled for guild {} (DAVE encryption active)", guildId);
-        }
-
+        encryptor.setPassthroughMode(false);
+        // receivers keep accepting unencrypted frames for a short grace period, then require DAVE
+        decryptor.transitionToPassthroughMode(false);
         state = State.ESTABLISHED;
-        pendingTransitionId = -1;
-        logger.debug("Executed transition {} for guild {} [state: {} -> ESTABLISHED]",
-                transitionId, guildId, oldState);
-    }
 
-    private void sendTransitionReady(int transitionId) {
-        sendJsonMessage(23, transitionId);
-    }
-
-    private void sendInvalidCommitWelcome(int transitionId) {
-        sendJsonMessage(31, transitionId);
-    }
-
-    private void resetAndResendKeyPackage() {
-        State oldState = state;
-        logger.debug("Resetting DAVE session for guild {} [oldState={}, protocolVersion={}, "
-                + "recognizedUsers({}): {}]",
-                guildId, oldState, protocolVersion,
-                recognizedUserIds.size(), recognizedUserIds);
-        if (encryptor != null) {
-            encryptor.setPassthroughMode(true);
-            logger.debug("Encryptor set to passthrough mode for guild {}", guildId);
+        if (oldState != State.ESTABLISHED) {
+            logger.info("DAVE E2EE established (transition {}, protocol version {}) for group {}",
+                    transitionId, version, groupIdSupplier.getAsLong());
+        } else {
+            logger.debug("Executed transition {} for group {}", transitionId, groupIdSupplier.getAsLong());
         }
-        if (session != null) {
+    }
+
+    /**
+     * Requests removal and re-add after a commit or welcome we could not process (opcode 31),
+     * then starts over with a fresh key package.
+     */
+    private void recoverFromInvalidCommitWelcome(int transitionId) {
+        if (reinitializing) {
+            logger.debug("Already recovering, not sending another invalid commit/welcome for transition {}",
+                    transitionId);
+            return;
+        }
+        reinitializing = true;
+        sendTransitionMessage(OP_MLS_INVALID_COMMIT_WELCOME, transitionId);
+        reinit();
+    }
+
+    /**
+     * Discards local MLS state and, for a non-zero protocol version, sends a fresh key package.
+     *
+     * <p>Uses {@link DaveSession#init}: libdave's reset alone also discards the leaf node and
+     * group ID, after which no key package can be generated. Until a transition executes, frames
+     * pass through, matching the reference clients while not in a group.
+     */
+    private void reinit() {
+        pendingTransitions.clear();
+        encryptor.setPassthroughMode(true);
+
+        if (protocolVersion == 0) {
             session.reset();
-            session.init(protocolVersion, guildId, selfUserId);
-            if (lastExternalSender != null) {
-                session.setExternalSender(lastExternalSender);
-            }
-            logger.debug("Session reset and re-initialized for guild {} [externalSender={}]",
-                    guildId, lastExternalSender != null ? "restored" : "none");
+            decryptor.transitionToPassthroughMode(true);
+            state = State.PASSTHROUGH;
+            return;
         }
-        sendKeyPackage();
+
+        session.init(protocolVersion, groupIdSupplier.getAsLong(), selfUserId);
+        Optional<byte[]> keyPackage = session.getMarshalledKeyPackage();
+        if (keyPackage.isPresent()) {
+            sendBinaryMessage(OP_MLS_KEY_PACKAGE, keyPackage.get());
+            logger.debug("Sent key package ({} bytes) for group {}",
+                    keyPackage.get().length, groupIdSupplier.getAsLong());
+        } else {
+            logger.error("Failed to generate DAVE key package for group {}; E2EE cannot be established",
+                    groupIdSupplier.getAsLong());
+        }
         state = State.AWAITING_GROUP;
-        logger.debug("Recovery: sent key package, state {} -> AWAITING_GROUP for guild {}", oldState, guildId);
+    }
+
+    private static int readTransitionId(byte[] payload) {
+        return ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
     }
 
     private void sendBinaryMessage(int opcode, byte[] data) {
@@ -511,9 +523,9 @@ public class DaveSessionManager implements AutoCloseable {
         gatewaySender.sendBinaryFrame(frame);
     }
 
-    private void sendJsonMessage(int opcode, int transitionId) {
-        String json = String.format("{\"op\":%d,\"d\":{\"transition_id\":%d}}", opcode, transitionId);
-        gatewaySender.sendTextFrame(json);
+    private void sendTransitionMessage(int opcode, int transitionId) {
+        gatewaySender.sendTextFrame(
+                String.format("{\"op\":%d,\"d\":{\"transition_id\":%d}}", opcode, transitionId));
     }
 
     private void cleanup() {
@@ -529,12 +541,16 @@ public class DaveSessionManager implements AutoCloseable {
             session.close();
             session = null;
         }
+        pendingTransitions.clear();
+        reinitializing = false;
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         cleanup();
         state = State.INACTIVE;
         recognizedUserIds.clear();
+        recognizedUserIds.add(selfUserId);
+        disconnectedUserIds.clear();
     }
 }

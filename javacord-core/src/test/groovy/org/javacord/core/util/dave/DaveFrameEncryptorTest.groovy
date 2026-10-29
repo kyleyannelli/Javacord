@@ -1,12 +1,15 @@
 package org.javacord.core.util.dave
 
 import com.sun.jna.Pointer
-import com.sun.jna.ptr.IntByReference
+import com.sun.jna.ptr.LongByReference
 import spock.lang.Specification
 import spock.lang.Subject
 
 @Subject(DaveFrameEncryptor)
 class DaveFrameEncryptorTest extends Specification {
+
+    static final Byte PT_ON = 1 as Byte
+    static final Byte PT_OFF = 0 as Byte
 
     static final Pointer FAKE_HANDLE = new Pointer(1L)
     static final Pointer FAKE_KEY_RATCHET = new Pointer(2L)
@@ -32,7 +35,7 @@ class DaveFrameEncryptorTest extends Specification {
 
         then:
             1 * lib.daveEncryptorEncrypt(FAKE_HANDLE, MEDIA_TYPE_AUDIO, SSRC,
-                    frame, 3, _ as byte[], 32, _ as IntByReference) >> { args ->
+                    frame, 3, _ as byte[], 32, _ as LongByReference) >> { args ->
                 args[7].setValue(5)
                 return 0
             }
@@ -50,7 +53,7 @@ class DaveFrameEncryptorTest extends Specification {
 
         then:
             1 * lib.daveEncryptorEncrypt(FAKE_HANDLE, MEDIA_TYPE_AUDIO, SSRC,
-                    frame, 1, _ as byte[], 16, _ as IntByReference) >> 1
+                    frame, 1, _ as byte[], 16, _ as LongByReference) >> 1
             !result.isPresent()
     }
 
@@ -64,7 +67,7 @@ class DaveFrameEncryptorTest extends Specification {
 
         then:
             1 * lib.daveEncryptorEncrypt(FAKE_HANDLE, MEDIA_TYPE_AUDIO, SSRC,
-                    frame, 1, _ as byte[], 16, _ as IntByReference) >> { args ->
+                    frame, 1, _ as byte[], 16, _ as LongByReference) >> { args ->
                 args[7].setValue(0)
                 return 0
             }
@@ -76,13 +79,13 @@ class DaveFrameEncryptorTest extends Specification {
             encryptor.setPassthroughMode(true)
 
         then:
-            1 * lib.daveEncryptorSetPassthroughMode(FAKE_HANDLE, true)
+            1 * lib.daveEncryptorSetPassthroughMode(FAKE_HANDLE, PT_ON)
 
         when:
             encryptor.setPassthroughMode(false)
 
         then:
-            1 * lib.daveEncryptorSetPassthroughMode(FAKE_HANDLE, false)
+            1 * lib.daveEncryptorSetPassthroughMode(FAKE_HANDLE, PT_OFF)
     }
 
     def 'assignSsrcToOpus uses correct codec constant'() {
@@ -98,7 +101,7 @@ class DaveFrameEncryptorTest extends Specification {
             def result = encryptor.hasKeyRatchet()
 
         then:
-            1 * lib.daveEncryptorHasKeyRatchet(FAKE_HANDLE) >> true
+            1 * lib.daveEncryptorHasKeyRatchet(FAKE_HANDLE) >> (byte) 1
             result
     }
 
@@ -107,7 +110,7 @@ class DaveFrameEncryptorTest extends Specification {
             def result = encryptor.isPassthroughMode()
 
         then:
-            1 * lib.daveEncryptorIsPassthroughMode(FAKE_HANDLE) >> true
+            1 * lib.daveEncryptorIsPassthroughMode(FAKE_HANDLE) >> (byte) 1
             result
     }
 
@@ -127,15 +130,66 @@ class DaveFrameEncryptorTest extends Specification {
             1 * lib.daveEncryptorDestroy(FAKE_HANDLE)
     }
 
-    def 'methods throw IllegalStateException after close'() {
+    def 'encrypt after close returns empty without touching the freed handle'() {
         given:
             encryptor.close()
 
         when:
-            encryptor.encrypt(SSRC, [0x01] as byte[])
+            def result = encryptor.encrypt(SSRC, [0x01] as byte[])
 
         then:
-            thrown(IllegalStateException)
+            !result.isPresent()
+            0 * lib.daveEncryptorEncrypt(*_)
+            0 * lib.daveEncryptorGetMaxCiphertextByteSize(*_)
+    }
+
+    def 'opus silence frame is never encrypted'() {
+        given:
+            byte[] silence = [0xF8, 0xFF, 0xFE] as byte[]
+
+        when:
+            def result = encryptor.encrypt(SSRC, silence)
+
+        then:
+            result.get() == silence
+            0 * lib.daveEncryptorEncrypt(*_)
+    }
+
+    def 'concurrent encrypt and close never encrypt on a destroyed handle'() {
+        given:
+            def destroyed = new java.util.concurrent.atomic.AtomicBoolean()
+            def usedAfterDestroy = new java.util.concurrent.atomic.AtomicBoolean()
+            lib.daveEncryptorGetMaxCiphertextByteSize(*_) >> 16L
+            lib.daveEncryptorEncrypt(*_) >> { args ->
+                // a destroy that lands while native encrypt is still running is the use-after-free
+                if (destroyed.get()) {
+                    usedAfterDestroy.set(true)
+                }
+                Thread.sleep(1)
+                if (destroyed.get()) {
+                    usedAfterDestroy.set(true)
+                }
+                args[7].setValue(1L)
+                return 0
+            }
+            lib.daveEncryptorDestroy(FAKE_HANDLE) >> { destroyed.set(true) }
+            def sender = Thread.start {
+                200.times { encryptor.encrypt(SSRC, [0x01] as byte[]) }
+            }
+
+        when:
+            Thread.sleep(20)
+            encryptor.close()
+            sender.join()
+
+        then:
+            destroyed.get()
+            !usedAfterDestroy.get()
+    }
+
+    def 'other methods throw IllegalStateException after close'() {
+        given:
+            encryptor.close()
 
         when:
             encryptor.setPassthroughMode(false)

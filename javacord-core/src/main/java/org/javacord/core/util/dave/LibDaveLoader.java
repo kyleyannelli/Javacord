@@ -1,6 +1,7 @@
 package org.javacord.core.util.dave;
 
 import com.sun.jna.Native;
+import com.sun.jna.NativeLibrary;
 import org.apache.logging.log4j.Logger;
 import org.javacord.core.util.logging.LoggerUtil;
 
@@ -36,13 +37,16 @@ public final class LibDaveLoader {
             synchronized (LibDaveLoader.class) {
                 if (!loadAttempted) {
                     try {
-                        instance = Native.load("dave", LibDave.class);
+                        LibDave lib = Native.load("dave", LibDave.class);
+                        // daveFree appeared in libdave 1.1.1; older builds expect free(), which we cannot call
+                        NativeLibrary.getInstance("dave").getFunction("daveFree");
+                        instance = lib;
                         installLogSink(instance);
                         logger.info("Successfully loaded libdave (max protocol version: {})",
                                 instance.daveMaxSupportedProtocolVersion());
                     } catch (UnsatisfiedLinkError e) {
                         loadError = e.getMessage();
-                        logger.warn("libdave native library not found on system library path. "
+                        logger.warn("libdave native library not found on system library path, or older than 1.1.1. "
                                 + "Voice connections requiring DAVE E2EE will not work. "
                                 + "Install libdave and ensure it is on your system library path "
                                 + "(LD_LIBRARY_PATH on Linux, DYLD_LIBRARY_PATH on macOS, PATH on Windows). "

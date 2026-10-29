@@ -3,7 +3,7 @@ package org.javacord.core.util.dave;
 import com.sun.jna.Callback;
 import com.sun.jna.Library;
 import com.sun.jna.Pointer;
-import com.sun.jna.ptr.IntByReference;
+import com.sun.jna.ptr.LongByReference;
 import com.sun.jna.ptr.PointerByReference;
 
 /**
@@ -13,6 +13,12 @@ import com.sun.jna.ptr.PointerByReference;
  * <p>All handles returned by {@code *Create} functions must be freed with
  * their corresponding {@code *Destroy} counterpart. Output byte arrays
  * allocated by the library must be freed using {@link #daveFree(Pointer)}.
+ *
+ * <p>Type mapping: C {@code size_t} is {@code long} and {@code size_t*} is {@link LongByReference}
+ * (64-bit platforms only). C {@code bool} return values are {@code byte}: JNA's {@code boolean}
+ * reads a 32-bit int, but a C {@code bool} return only defines the low 8 bits. C {@code bool} parameters
+ * are {@code byte} 0 or 1: JNA passes a Java {@code true} as the int -1, which is not a valid C {@code bool}.
+ * Requires libdave 1.1.1 or newer ({@code daveFree} does not exist before that).
  *
  * @see <a href="https://daveprotocol.com">DAVE Protocol Specification</a>
  */
@@ -62,7 +68,7 @@ public interface LibDave extends Library {
      *
      * @param session    Session handle.
      * @param version    Protocol version to use.
-     * @param groupId    Group identifier (guild ID).
+     * @param groupId    MLS group identifier (the voice channel ID).
      * @param selfUserId User ID of the local user as a string.
      */
     void daveSessionInit(Pointer session, short version, long groupId, String selfUserId);
@@ -99,7 +105,7 @@ public interface LibDave extends Library {
      */
     void daveSessionGetLastEpochAuthenticator(Pointer session,
                                               PointerByReference authenticator,
-                                              IntByReference length);
+                                              LongByReference length);
 
     /**
      * Sets the external sender credentials for the session.
@@ -108,7 +114,7 @@ public interface LibDave extends Library {
      * @param externalSender External sender credential bytes.
      * @param length         Length of external sender data.
      */
-    void daveSessionSetExternalSender(Pointer session, byte[] externalSender, int length);
+    void daveSessionSetExternalSender(Pointer session, byte[] externalSender, long length);
 
     /**
      * Processes MLS proposals and generates commit/welcome messages.
@@ -122,10 +128,10 @@ public interface LibDave extends Library {
      * @param commitWelcomeBytesLength  Output length of the commit/welcome message.
      */
     void daveSessionProcessProposals(Pointer session,
-                                     byte[] proposals, int length,
-                                     String[] recognizedUserIds, int recognizedUserIdsLength,
+                                     byte[] proposals, long length,
+                                     String[] recognizedUserIds, long recognizedUserIdsLength,
                                      PointerByReference commitWelcomeBytes,
-                                     IntByReference commitWelcomeBytesLength);
+                                     LongByReference commitWelcomeBytesLength);
 
     /**
      * Processes an incoming MLS commit message.
@@ -135,7 +141,7 @@ public interface LibDave extends Library {
      * @param length  Length of commit message.
      * @return Commit result handle. Must be destroyed with {@link #daveCommitResultDestroy(Pointer)}.
      */
-    Pointer daveSessionProcessCommit(Pointer session, byte[] commit, int length);
+    Pointer daveSessionProcessCommit(Pointer session, byte[] commit, long length);
 
     /**
      * Processes an incoming MLS welcome message to join a group.
@@ -148,8 +154,8 @@ public interface LibDave extends Library {
      * @return Welcome result handle. Must be destroyed with {@link #daveWelcomeResultDestroy(Pointer)}.
      */
     Pointer daveSessionProcessWelcome(Pointer session,
-                                      byte[] welcome, int length,
-                                      String[] recognizedUserIds, int recognizedUserIdsLength);
+                                      byte[] welcome, long length,
+                                      String[] recognizedUserIds, long recognizedUserIdsLength);
 
     /**
      * Gets the marshalled MLS key package for this session.
@@ -160,7 +166,7 @@ public interface LibDave extends Library {
      */
     void daveSessionGetMarshalledKeyPackage(Pointer session,
                                             PointerByReference keyPackage,
-                                            IntByReference length);
+                                            LongByReference length);
 
     /**
      * Gets a key ratchet for a specific user in the session.
@@ -186,17 +192,17 @@ public interface LibDave extends Library {
      * Checks if processing the commit failed.
      *
      * @param commitResult Commit result handle.
-     * @return {@code true} if commit processing failed.
+     * @return Non-zero if commit processing failed.
      */
-    boolean daveCommitResultIsFailed(Pointer commitResult);
+    byte daveCommitResultIsFailed(Pointer commitResult);
 
     /**
      * Checks if the commit should be ignored.
      *
      * @param commitResult Commit result handle.
-     * @return {@code true} if commit should be ignored.
+     * @return Non-zero if the commit should be ignored.
      */
-    boolean daveCommitResultIsIgnored(Pointer commitResult);
+    byte daveCommitResultIsIgnored(Pointer commitResult);
 
     /**
      * Gets the list of member IDs in the roster after the commit.
@@ -207,7 +213,7 @@ public interface LibDave extends Library {
      */
     void daveCommitResultGetRosterMemberIds(Pointer commitResult,
                                             PointerByReference rosterIds,
-                                            IntByReference rosterIdsLength);
+                                            LongByReference rosterIdsLength);
 
     /**
      * Destroys a commit result and frees associated resources.
@@ -227,7 +233,7 @@ public interface LibDave extends Library {
      */
     void daveWelcomeResultGetRosterMemberIds(Pointer welcomeResult,
                                              PointerByReference rosterIds,
-                                             IntByReference rosterIdsLength);
+                                             LongByReference rosterIdsLength);
 
     /**
      * Destroys a welcome result and frees associated resources.
@@ -255,6 +261,8 @@ public interface LibDave extends Library {
     /**
      * Sets the key ratchet for encryption.
      *
+     * <p>The encryptor copies the ratchet; the caller still owns {@code keyRatchet} and must destroy it.
+     *
      * @param encryptor  Encryptor handle.
      * @param keyRatchet Key ratchet to use for encryption.
      */
@@ -264,9 +272,9 @@ public interface LibDave extends Library {
      * Enables or disables passthrough mode.
      *
      * @param encryptor      Encryptor handle.
-     * @param passthroughMode {@code true} to enable passthrough, {@code false} to encrypt.
+     * @param passthroughMode 1 to enable passthrough, 0 to encrypt.
      */
-    void daveEncryptorSetPassthroughMode(Pointer encryptor, boolean passthroughMode);
+    void daveEncryptorSetPassthroughMode(Pointer encryptor, byte passthroughMode);
 
     /**
      * Associates an SSRC with a specific codec.
@@ -281,17 +289,17 @@ public interface LibDave extends Library {
      * Checks if the encryptor has a key ratchet.
      *
      * @param encryptor Encryptor handle.
-     * @return {@code true} if has key ratchet.
+     * @return Non-zero if the encryptor has a key ratchet.
      */
-    boolean daveEncryptorHasKeyRatchet(Pointer encryptor);
+    byte daveEncryptorHasKeyRatchet(Pointer encryptor);
 
     /**
      * Checks if the encryptor is in passthrough mode.
      *
      * @param encryptor Encryptor handle.
-     * @return {@code true} if in passthrough mode.
+     * @return Non-zero if in passthrough mode.
      */
-    boolean daveEncryptorIsPassthroughMode(Pointer encryptor);
+    byte daveEncryptorIsPassthroughMode(Pointer encryptor);
 
     /**
      * Calculates the maximum ciphertext size for a given plaintext frame size.
@@ -301,7 +309,7 @@ public interface LibDave extends Library {
      * @param frameSize Size of plaintext frame in bytes.
      * @return Maximum possible ciphertext size in bytes.
      */
-    int daveEncryptorGetMaxCiphertextByteSize(Pointer encryptor, int mediaType, int frameSize);
+    long daveEncryptorGetMaxCiphertextByteSize(Pointer encryptor, int mediaType, long frameSize);
 
     /**
      * Encrypts a media frame.
@@ -317,9 +325,9 @@ public interface LibDave extends Library {
      * @return Result code (0=Success).
      */
     int daveEncryptorEncrypt(Pointer encryptor, int mediaType, int ssrc,
-                             byte[] frame, int frameLength,
-                             byte[] encryptedFrame, int encryptedFrameCapacity,
-                             IntByReference bytesWritten);
+                             byte[] frame, long frameLength,
+                             byte[] encryptedFrame, long encryptedFrameCapacity,
+                             LongByReference bytesWritten);
 
     // ---- Decryptor ----
 
@@ -340,6 +348,8 @@ public interface LibDave extends Library {
     /**
      * Transitions the decryptor to use a new key ratchet.
      *
+     * <p>The decryptor copies the ratchet; the caller still owns {@code keyRatchet} and must destroy it.
+     *
      * @param decryptor  Decryptor handle.
      * @param keyRatchet New key ratchet to transition to.
      */
@@ -349,9 +359,9 @@ public interface LibDave extends Library {
      * Transitions to or from passthrough mode.
      *
      * @param decryptor       Decryptor handle.
-     * @param passthroughMode {@code true} to enable passthrough.
+     * @param passthroughMode 1 to enable passthrough, 0 to disable it.
      */
-    void daveDecryptorTransitionToPassthroughMode(Pointer decryptor, boolean passthroughMode);
+    void daveDecryptorTransitionToPassthroughMode(Pointer decryptor, byte passthroughMode);
 
     /**
      * Decrypts an encrypted media frame.
@@ -366,9 +376,9 @@ public interface LibDave extends Library {
      * @return Result code (0=Success).
      */
     int daveDecryptorDecrypt(Pointer decryptor, int mediaType,
-                             byte[] encryptedFrame, int encryptedFrameLength,
-                             byte[] frame, int frameCapacity,
-                             IntByReference bytesWritten);
+                             byte[] encryptedFrame, long encryptedFrameLength,
+                             byte[] frame, long frameCapacity,
+                             LongByReference bytesWritten);
 
     /**
      * Calculates the maximum plaintext size for a given ciphertext frame size.
@@ -378,7 +388,7 @@ public interface LibDave extends Library {
      * @param encryptedFrameSize Size of encrypted frame in bytes.
      * @return Maximum possible plaintext size in bytes.
      */
-    int daveDecryptorGetMaxPlaintextByteSize(Pointer decryptor, int mediaType, int encryptedFrameSize);
+    long daveDecryptorGetMaxPlaintextByteSize(Pointer decryptor, int mediaType, long encryptedFrameSize);
 
     // ---- Logging ----
 
